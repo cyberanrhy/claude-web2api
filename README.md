@@ -1,5 +1,7 @@
 # Claude Web2API
 
+<img src="preview.jpeg" alt="Claude Web2API screenshot" width="100%">
+
 OpenAI-compatible proxy for [Claude.ai](https://claude.ai) Web API.
 
 Converts standard `/v1/chat/completions` requests to Claude.ai internal API. Bypasses Cloudflare via TLS fingerprint impersonation (`curl_cffi`).
