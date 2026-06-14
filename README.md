@@ -1,4 +1,4 @@
-![Claude Web2API screenshot](preview.jpg)
+![Claude Web2API screenshot](https://raw.githubusercontent.com/cyberanrhy/claude-web2api/4207588/preview.jpg)
 
 # Claude Web2API
 
