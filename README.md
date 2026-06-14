@@ -2,25 +2,28 @@
 
 OpenAI-compatible proxy for [Claude.ai](https://claude.ai) Web API.
 
-Translate standard `/v1/chat/completions` requests to Claude.ai internal API. Bypasses Cloudflare via TLS fingerprint impersonation.
+Converts standard `/v1/chat/completions` requests to Claude.ai internal API. Bypasses Cloudflare via TLS fingerprint impersonation (`curl_cffi`).
 
 ## Features
 
 - OpenAI-compatible `/v1/chat/completions` endpoint
-- Streaming (SSE) and non-streaming modes
-- Supports all Claude models (model is selected automatically by Claude)
-- Conversation history via prompt formatting (`Human: ... / Assistant: ...`)
-- Cloudflare bypass via `curl_cffi` with `impersonate="chrome110"`
-- CORS enabled for browser access
+- Streaming (SSE) and non-streaming
+- All Claude models (Claude.ai selects automatically based on your account)
+- Conversation history via `Human: / Assistant:` formatting
+- CORS enabled
 
-## Prerequisites
+## Requirements
 
-- Python 3.10+
-- `curl_cffi` library
-- Active Claude.ai session (cookies)
-- Proxy/VPN for Cloudflare bypass (required for most regions)
+- **Python 3.10+**
+- `pip install -r requirements.txt` (just `curl_cffi`)
+- **Firefox** with [cookies.txt](https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/) extension
+- **Proxy/VPN** that can reach Claude.ai through Cloudflare (see note below)
 
-## Installation
+> **Cloudflare note:** Claude.ai is behind Cloudflare. Most users need a proxy. Set `"proxy"` in config.json — see [Configuration] below.
+
+## Setup (step by step)
+
+### 1. Clone & install
 
 ```bash
 git clone https://github.com/YOUR_USERNAME/claude-web2api.git
@@ -28,88 +31,88 @@ cd claude-web2api
 pip install -r requirements.txt
 ```
 
-## Quick Start
-
-### 1. Export cookies
-
-1. Install browser extension [cookies.txt](https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/) (Firefox) or equivalent
-2. Log in to [Claude.ai](https://claude.ai/chats)
-3. Export cookies in **Netscape format**
-4. Save as `cookie_claude.txt` in the project directory
-
-### 2. Configure
-
-Copy the example config and edit if needed:
+### 2. Copy config
 
 ```bash
 cp config.json.example config.json
 ```
 
-Default config works out of the box. If you need a proxy for upstream requests:
+### 3. Export cookies
+
+1. Log in to [Claude.ai](https://claude.ai/chats) in **Firefox**
+2. Install [cookies.txt](https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/) extension
+3. Click the extension icon → **Export** → save as `cookie_claude.txt`
+4. Put the file in the project directory (alongside `claude_web2api.py`)
+
+> **Important:** The file **must** be named `cookie_claude.txt` and be in **Netscape format** (tabs between fields).
+
+### 4. Configure proxy (for Cloudflare)
+
+Open `config.json` and set your proxy if you're in a region where Cloudflare blocks direct access:
 
 ```json
 {
-  "proxy": "http://proxy:port"
+  "proxy": "http://127.0.0.1:8080"
 }
 ```
 
-### 3. Run
+Common proxy setups:
+- **Hiddify / sing-box / v2ray** running locally: `"proxy": "http://127.0.0.1:12334"`
+- **SOCKS5 proxy**: `"proxy": "socks5://127.0.0.1:1080"`
+- No proxy needed (rare): `"proxy": null` (default)
 
-```bash
-bash start.sh
-```
+> If you're unsure: try running without proxy first. If you get TLS/connection errors, set `"proxy"`.
 
-Or directly:
+### 5. Run
 
 ```bash
 python3 claude_web2api.py
 ```
 
-Server starts on `http://0.0.0.0:8082`.
-
-## API
-
-### `GET /v1/models`
-
-Returns available Claude models.
-
-### `POST /v1/chat/completions`
-
-OpenAI-compatible chat completions endpoint.
-
-**Request:**
-
-```json
-{
-  "model": "claude-3-5-sonnet-20241022",
-  "messages": [
-    {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": "Hello!"}
-  ],
-  "stream": false
-}
+Expected output:
+```
+* Proxy server running on http://0.0.0.0:8082
+* Logged in as: your@email.com
 ```
 
-**Response (non-streaming):**
+If you see **403 Forbidden** — your cookies expired. Re-export from Firefox.
 
-```json
-{
-  "id": "chatcmpl-xxx",
-  "object": "chat.completion",
-  "choices": [{
-    "message": {
-      "role": "assistant",
-      "content": "Hi! How can I help you?"
-    }
-  }]
-}
+### 6. Verify it works
+
+```bash
+# Check server is alive
+curl -s http://localhost:8082/v1/models | head -c 200
+
+# Send a message (non-streaming)
+curl -s -X POST http://localhost:8082/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Say hello in 3 words"}]}'
+
+# Send a message (streaming)
+curl -s -N -X POST http://localhost:8082/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Count to 5"}],"stream":true}'
 ```
 
-**Response (streaming):** Server-Sent Events with `[DONE]` termination.
+## Configuration reference
 
-## Usage with OpenCode / AI SDK
+| Field | Default | Description |
+|---|---|---|
+| `port` | `8082` | Server port |
+| `host` | `"0.0.0.0"` | Bind address |
+| `proxy` | `null` | HTTP proxy for upstream (Claude.ai) |
+| `model` | `"claude"` | Model name sent to OpenAI client |
+| `log_requests` | `false` | Log request/response bodies |
 
-Configure provider in your `opencode.json`:
+## How it works
+
+1. You send a standard OpenAI chat request to `/v1/chat/completions`
+2. The proxy creates a new chat on Claude.ai
+3. Sends your message(s) formatted as `Human: ...\n\nAssistant: ...`
+4. Streams the response back (or returns it as JSON)
+5. Deletes the chat from Claude.ai (no history left behind)
+
+## Usage with OpenCode
 
 ```json
 {
@@ -120,59 +123,37 @@ Configure provider in your `opencode.json`:
       "options": {
         "baseURL": "http://localhost:8082/v1",
         "apiKey": "sk-proxy",
-        "timeout": 240000,
-        "headerTimeout": 60000,
-        "chunkTimeout": 120000
+        "timeout": 240000
       },
       "models": {
-        "claude-3-5-sonnet-20241022": {
-          "name": "Claude 3.5 Sonnet"
-        }
+        "claude-3-5-sonnet-20241022": { "name": "Claude" }
       }
     }
   }
 }
 ```
 
-## Health Check
+## FAQ
 
-```
-GET /health
-```
+### Q: 403 Forbidden on startup
+**Cookies expired.** Re-export from Firefox. Claude.ai cookies last ~1 month.
 
-Returns server status, organization ID, and cookie state.
-
-## Troubleshooting / FAQ
-
-### Q: 403 Forbidden
-Cookies expired. Export fresh cookies from Claude.ai and restart.
-
-### Q: TLS / connection errors
-Claude.ai is protected by Cloudflare. You must route requests through a proxy/VPN that can handle Cloudflare challenges. Set `"proxy"` in `config.json`.
-
-### Q: Bad Gateway: upstream error 403
-The model name sent to Claude.ai might be unrecognized. The proxy no longer forwards model names to upstream by default.
+### Q: TLS / connection errors / "OpenSSL error"
+Claude.ai is blocked by Cloudflare in most regions. You **need a proxy** — set `"proxy"` in config.json.
 
 ### Q: Requests hang / timeout
-- Check that your proxy is running and accessible
-- Increase timeout values in your client configuration
-- Export fresh cookies
-
-### Q: How to refresh cookies
-1. Open Claude.ai in Firefox
-2. Export cookies via cookies.txt extension
-3. Replace `cookie_claude.txt`
-4. Restart the proxy
+1. Check your proxy is running
+2. Check cookies are fresh
+3. Increase `timeout` in your client config
 
 ### Q: Which model is used?
-Claude.ai selects the model automatically based on your account and subscription.
+Claude.ai selects the model automatically based on your subscription. Free accounts get limited models.
 
-### Q: Can I use this with curl?
-```bash
-curl -X POST http://localhost:8082/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"Hello"}],"stream":true}'
-```
+### Q: How to refresh cookies?
+Firefox → Claude.ai → cookies.txt extension → Export → overwrite `cookie_claude.txt` → restart proxy
+
+### Q: Error "curl_cffi not found"
+Run `pip install -r requirements.txt`. If on ARM Linux (Raspberry Pi), `curl_cffi` has no pre-built wheel — you'll need to compile from source.
 
 ## Files
 
@@ -182,8 +163,8 @@ claude-web2api/
 ├── config.json.example    # Configuration template
 ├── requirements.txt       # Python dependencies
 ├── start.sh               # Start script
-├── cookie_claude.txt      # Netscape cookies (gitignored)
-├── config.json            # Active config (gitignored)
+├── cookie_claude.txt      # Cookies (gitignored, you create this)
+├── config.json            # Active config (gitignored, from .example)
 ├── README.md
 └── LICENSE
 ```
