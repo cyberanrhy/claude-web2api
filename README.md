@@ -25,7 +25,7 @@ Translate standard `/v1/chat/completions` requests to Claude.ai internal API. By
 ```bash
 git clone https://github.com/YOUR_USERNAME/claude-web2api.git
 cd claude-web2api
-pip install curl_cffi
+pip install -r requirements.txt
 ```
 
 ## Quick Start
@@ -180,6 +180,7 @@ curl -X POST http://localhost:8082/v1/chat/completions \
 claude-web2api/
 ├── claude_web2api.py      # Proxy server
 ├── config.json.example    # Configuration template
+├── requirements.txt       # Python dependencies
 ├── start.sh               # Start script
 ├── cookie_claude.txt      # Netscape cookies (gitignored)
 ├── config.json            # Active config (gitignored)
