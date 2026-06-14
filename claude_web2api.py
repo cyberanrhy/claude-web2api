@@ -18,6 +18,17 @@ def log(msg):
 def load_config():
     global CONFIG
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    if not os.path.exists(path):
+        example = path + ".example"
+        if os.path.exists(example):
+            with open(example) as src, open(path, "w") as dst:
+                dst.write(src.read())
+            log(f"Created config.json from config.json.example")
+        else:
+            print("ERROR: config.json not found.")
+            print(f"  Run: cp config.json.example config.json")
+            print("  Then run again.")
+            sys.exit(1)
     with open(path) as f:
         CONFIG = json.load(f)
     log(f"config loaded: port={CONFIG.get('port', 8082)}")
@@ -27,8 +38,12 @@ def load_cookies():
     path = CONFIG.get("cookie_file") or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "cookie_claude.txt")
     if not os.path.exists(path):
-        log(f"cookie file not found: {path}")
-        return False
+        print(f"ERROR: cookie file not found at '{path}'.")
+        print("  1. Open https://claude.ai/chats in Firefox and log in")
+        print("  2. Install 'cookies.txt' extension (https://addons.mozilla.org/firefox/addon/cookies-txt/)")
+        print("  3. Click the extension → Export → save as the file above")
+        print("  4. Then run again")
+        sys.exit(1)
     cookies = []
     with open(path) as f:
         for line in f:
