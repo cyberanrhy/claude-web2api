@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Claude.ai -> OpenAI-compatible proxy (port 8082)"""
 
-import json, os, sys, time, uuid
+import json, os, sys, time, uuid, re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
@@ -110,19 +110,76 @@ def delete_chat(org_id, chat_id):
     except:
         pass
 
-def format_prompt(messages):
+def format_prompt(messages, tools=None):
     parts = []
+    if tools:
+        tool_defs = []
+        for t in tools:
+            fn = t.get("function", t) if t.get("type") == "function" else t
+            tool_defs.append({
+                "name": fn.get("name", t.get("name", "")),
+                "description": fn.get("description", t.get("description", "")),
+                "parameters": fn.get("parameters", t.get("parameters", {})),
+            })
+        if tool_defs:
+            parts.append(
+                "Human: [Tools] I've configured the following tools for this "
+                "conversation. When you need to call one, respond with a JSON "
+                "code block using this exact format:\n"
+                '```tool_call\n{"name": "function_name", "arguments": {...}}\n```\n'
+                "Then wait for the tool result before continuing.\n\n"
+                f"Available tool definitions:\n{json.dumps(tool_defs, indent=2)}"
+            )
     for msg in messages:
         role = msg.get("role", "user")
         content = msg.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(
+                c.get("text", "") for c in content
+                if c.get("type") in ("text", "input_text")
+            )
         if role == "system":
             parts.append(f"System: {content}")
         elif role == "user":
             parts.append(f"Human: {content}")
         elif role == "assistant":
-            parts.append(f"Assistant: {content}")
+            if msg.get("tool_calls"):
+                tc_strs = []
+                for tc in msg["tool_calls"]:
+                    fn = tc.get("function", {})
+                    tc_strs.append(
+                        f'```tool_call\n{{"name": "{fn.get("name")}", '
+                        f'"arguments": {fn.get("arguments", "{}")}}}\n```'
+                    )
+                parts.append(f"Assistant: {content or ''}\n" + "\n".join(tc_strs))
+            else:
+                parts.append(f"Assistant: {content}")
+        elif role == "tool":
+            parts.append(f"Tool result for {msg.get('name', '')}: {content}")
+        else:
+            parts.append(content if content else "")
     parts.append("Assistant:")
     return "\n\n".join(parts)
+
+def parse_tool_calls(text):
+    """Extract ```tool_call blocks from response. Returns (clean_text, tool_calls_list)."""
+    tool_calls = []
+    pattern = r'```tool_call\s*\n(.*?)\n```'
+    for match in re.findall(pattern, text, re.DOTALL):
+        try:
+            data = json.loads(match.strip())
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:12]}",
+                "type": "function",
+                "function": {
+                    "name": data["name"],
+                    "arguments": json.dumps(data.get("arguments", {}), ensure_ascii=False),
+                },
+            })
+        except (json.JSONDecodeError, KeyError):
+            pass
+    clean = re.sub(pattern, '', text, flags=re.DOTALL).strip()
+    return clean, tool_calls
 
 def get_timezone():
     import subprocess
@@ -241,8 +298,9 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
 
         stream = req.get("stream", False)
         model = req.get("model") or CONFIG.get("model") or "claude"
-        prompt = format_prompt(messages)
-        log(f"chat request: model={model}, stream={stream}, messages={len(messages)}")
+        tools = req.get("tools")
+        prompt = format_prompt(messages, tools)
+        log(f"chat request: model={model}, stream={stream}, messages={len(messages)}, tools={bool(tools)}")
 
         # Send streaming headers immediately so client doesn't wait
         if stream:
@@ -289,9 +347,9 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
                 return
 
             if stream:
-                self._stream_response(upstream, model)
+                self._stream_response(upstream, model, tools)
             else:
-                self._blocking_response(upstream, model)
+                self._blocking_response(upstream, model, tools)
 
         except Exception as e:
             log(f"request error: {e}")
@@ -306,40 +364,69 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
             except:
                 pass
 
-    def _stream_response(self, upstream, model):
+    def _stream_response(self, upstream, model, tools=None):
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
 
-        for line in iter_sse_lines(upstream):
-            if not line or not line.startswith("data: "):
-                continue
-            try:
-                data = json.loads(line[6:])
-            except:
-                continue
+        if tools:
+            # Buffer full response when tools present (need complete text to parse tool calls)
+            full_text = ""
+            for line in iter_sse_lines(upstream):
+                if not line or not line.startswith("data: "):
+                    continue
+                try:
+                    data = json.loads(line[6:])
+                except:
+                    continue
+                if data.get("type") == "completion":
+                    full_text += data.get("completion", "")
+                elif data.get("type") == "error":
+                    log(f"upstream SSE error: {data}")
+                    break
 
-            if data.get("type") == "completion":
-                text = data.get("completion", "")
-                if text:
-                    chunk = {
-                        "id": completion_id, "object": "chat.completion.chunk",
-                        "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]
-                    }
-                    self._send_sse(json.dumps(chunk, ensure_ascii=False))
-            elif data.get("type") == "error":
-                log(f"upstream SSE error: {data}")
-                break
+            clean_text, tool_calls = parse_tool_calls(full_text)
+            msg = {"role": "assistant", "content": clean_text or None}
+            if tool_calls:
+                msg["tool_calls"] = tool_calls
+            finish = "tool_calls" if tool_calls else "stop"
+            chunk = {
+                "id": completion_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": msg, "finish_reason": finish}]
+            }
+            self._send_sse(json.dumps(chunk, ensure_ascii=False))
+        else:
+            # True streaming: forward chunks as they arrive
+            for line in iter_sse_lines(upstream):
+                if not line or not line.startswith("data: "):
+                    continue
+                try:
+                    data = json.loads(line[6:])
+                except:
+                    continue
+                if data.get("type") == "completion":
+                    text = data.get("completion", "")
+                    if text:
+                        chunk = {
+                            "id": completion_id, "object": "chat.completion.chunk",
+                            "created": created, "model": model,
+                            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]
+                        }
+                        self._send_sse(json.dumps(chunk, ensure_ascii=False))
+                elif data.get("type") == "error":
+                    log(f"upstream SSE error: {data}")
+                    break
 
-        final = {
-            "id": completion_id, "object": "chat.completion.chunk",
-            "created": created, "model": model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-        }
-        self._send_sse(json.dumps(final, ensure_ascii=False))
+            final = {
+                "id": completion_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            }
+            self._send_sse(json.dumps(final, ensure_ascii=False))
+
         self._send_sse("[DONE]")
 
-    def _blocking_response(self, upstream, model):
+    def _blocking_response(self, upstream, model, tools=None):
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
         content_parts = []
@@ -358,18 +445,24 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
                 self._json_response(502, {"error": data.get("message", str(data))})
                 return
 
-        content = "".join(content_parts).strip()
-        resp = {
+        full_text = "".join(content_parts)
+        if tools:
+            clean_text, tool_calls = parse_tool_calls(full_text)
+        else:
+            clean_text = full_text.strip()
+            tool_calls = None
+
+        msg = {"role": "assistant", "content": clean_text or None}
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+        finish = "tool_calls" if tool_calls else "stop"
+
+        self._json_response(200, {
             "id": completion_id, "object": "chat.completion",
             "created": created, "model": model,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop"
-            }],
+            "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        }
-        self._json_response(200, resp)
+        })
 
 
 def main():
