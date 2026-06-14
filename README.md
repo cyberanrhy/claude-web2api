@@ -1,4 +1,4 @@
-<img src="preview.jpeg" alt="Claude Web2API screenshot" width="100%">
+![Claude Web2API screenshot](preview.jpeg)
 
 # Claude Web2API
 
