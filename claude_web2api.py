@@ -332,9 +332,17 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
                 "timezone": get_timezone(),
             }
 
-            upstream = claude_req("POST",
-                f"/api/organizations/{ORGANIZATION_ID}/chat_conversations/{chat_id}/completion",
-                json=payload, headers=headers, stream=True, timeout=240)
+            max_retries = 3
+            for attempt in range(max_retries):
+                upstream = claude_req("POST",
+                    f"/api/organizations/{ORGANIZATION_ID}/chat_conversations/{chat_id}/completion",
+                    json=payload, headers=headers, stream=True, timeout=240)
+                if upstream.status_code == 429 and attempt < max_retries - 1:
+                    delay = 2 ** attempt  # 1, 2, 4 seconds
+                    log(f"rate limited (429), retry {attempt+1}/{max_retries} in {delay}s...")
+                    time.sleep(delay)
+                    continue
+                break
 
             if upstream.status_code != 200:
                 err_text = upstream.text[:500]
