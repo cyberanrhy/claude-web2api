@@ -11,6 +11,7 @@ CONFIG = {}
 COOKIE_STRING = ""
 ORGANIZATION_ID = None
 CLAUDE_BASE = "https://claude.ai"
+_SESSION = None
 
 def log(msg):
     print(f"[claude-proxy] {msg}", file=sys.stderr, flush=True)
@@ -58,17 +59,29 @@ def load_cookies():
     return bool(cookies)
 
 def _session():
-    s = Session(impersonate="chrome110")
-    s.headers.update({
-        "User-Agent": CONFIG.get("user_agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"),
-        "Accept-Language": "en-US,en;q=0.5",
-        "DNT": "1",
-    })
-    if CONFIG.get("proxy"):
-        s.proxies = {"http": CONFIG["proxy"], "https": CONFIG["proxy"]}
-    s.trust_env = False
-    return s
+    global _SESSION
+    if _SESSION is None:
+        s = Session(impersonate="chrome110")
+        s.headers.update({
+            "User-Agent": CONFIG.get("user_agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"),
+            "Accept-Language": "en-US,en;q=0.5",
+            "DNT": "1",
+        })
+        if CONFIG.get("proxy"):
+            s.proxies = {"http": CONFIG["proxy"], "https": CONFIG["proxy"]}
+        s.trust_env = False
+        _SESSION = s
+    return _SESSION
+
+def _reset_session():
+    global _SESSION
+    if _SESSION is not None:
+        try:
+            _SESSION.close()
+        except:
+            pass
+        _SESSION = None
 
 def claude_req(method, path, **kwargs):
     headers = kwargs.pop("headers", {})
