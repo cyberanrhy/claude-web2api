@@ -1,6 +1,6 @@
-# Claude Web2API
-
 <img src="preview.jpeg" alt="Claude Web2API screenshot" width="100%">
+
+# Claude Web2API
 
 OpenAI-compatible proxy for [Claude.ai](https://claude.ai) Web API.
 
