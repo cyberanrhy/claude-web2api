@@ -158,21 +158,26 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
 
     def _json_response(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Connection", "close")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self._sendall(body)
+        reason = {200: "OK", 400: "Bad Request", 401: "Unauthorized",
+                  404: "Not Found", 502: "Bad Gateway", 503: "Service Unavailable"}.get(code, "")
+        self._sendall(
+            f"HTTP/1.1 {code} {reason}\r\n"
+            f"Content-Type: application/json; charset=utf-8\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"Connection: close\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "\r\n".encode() + body
+        )
 
     def _sse_headers(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
+        self._sendall(
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/event-stream; charset=utf-8\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: keep-alive\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "\r\n".encode()
+        )
 
     def _send_sse(self, data: str):
         self._sendall(f"data: {data}\n\n".encode())
