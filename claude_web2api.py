@@ -308,11 +308,11 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
 
         chat_id = create_chat(ORGANIZATION_ID)
         if not chat_id:
+            msg = "Failed to create chat on Claude.ai (rate limited or session expired). Refresh cookies and try again."
             if not stream:
-                self._json_response(502, {"error": "failed to create chat"})
+                self._json_response(502, {"error": msg})
             else:
-                # Already sent SSE headers, send error inside stream
-                err_chunk = {"choices": [{"delta": {}, "finish_reason": "stop", "index": 0}]}
+                err_chunk = {"choices": [{"index": 0, "delta": {"content": msg}, "finish_reason": "stop"}]}
                 self._send_sse(json.dumps(err_chunk))
                 self._send_sse("[DONE]")
             return
@@ -332,13 +332,13 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
                 "timezone": get_timezone(),
             }
 
-            max_retries = 3
+            max_retries = 4
             for attempt in range(max_retries):
                 upstream = claude_req("POST",
                     f"/api/organizations/{ORGANIZATION_ID}/chat_conversations/{chat_id}/completion",
                     json=payload, headers=headers, stream=True, timeout=240)
                 if upstream.status_code == 429 and attempt < max_retries - 1:
-                    delay = 2 ** attempt  # 1, 2, 4 seconds
+                    delay = 2 ** (attempt + 1)  # 2, 4, 8 seconds
                     log(f"rate limited (429), retry {attempt+1}/{max_retries} in {delay}s...")
                     time.sleep(delay)
                     continue
@@ -348,10 +348,12 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
                 err_text = upstream.text[:500]
                 log(f"upstream error: {upstream.status_code} {err_text}")
                 if stream:
-                    self._send_sse(json.dumps({"choices": [{"delta": {}, "finish_reason": "stop", "index": 0}]}))
+                    msg = f"Claude.ai rate limit ({upstream.status_code}). Wait a minute and try again."
+                    err_chunk = {"choices": [{"index": 0, "delta": {"content": msg}, "finish_reason": "stop"}]}
+                    self._send_sse(json.dumps(err_chunk))
                     self._send_sse("[DONE]")
                 else:
-                    self._json_response(502, {"error": f"upstream error {upstream.status_code}", "detail": err_text})
+                    self._json_response(502, {"error": f"Claude.ai rate limit ({upstream.status_code}). Wait a minute and try again."})
                 return
 
             if stream:
