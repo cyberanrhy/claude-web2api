@@ -1,4 +1,4 @@
-![Claude Web2API screenshot](preview.png)
+![Claude Web2API screenshot](preview.jpg)
 
 # Claude Web2API
 
