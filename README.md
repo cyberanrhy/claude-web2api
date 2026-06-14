@@ -17,9 +17,7 @@ Converts standard `/v1/chat/completions` requests to Claude.ai internal API. Byp
 - **Python 3.10+**
 - `pip install -r requirements.txt` (just `curl_cffi`)
 - **Firefox** with [cookies.txt](https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/) extension
-- **Proxy/VPN** that can reach Claude.ai through Cloudflare (see note below)
-
-> **Cloudflare note:** Claude.ai is behind Cloudflare. Most users need a proxy. Set `"proxy"` in config.json — see [Configuration] below.
+- **Optional:** Proxy/VPN if Claude.ai is blocked in your region or returns Cloudflare errors
 
 ## Setup (step by step)
 
@@ -46,9 +44,9 @@ cp config.json.example config.json
 
 > **Important:** The file **must** be named `cookie_claude.txt` and be in **Netscape format** (tabs between fields).
 
-### 4. Configure proxy (for Cloudflare)
+### 4. Configure proxy (if needed)
 
-Open `config.json` and set your proxy if you're in a region where Cloudflare blocks direct access:
+Try running without a proxy first. The `curl_cffi` impersonation handles most Cloudflare challenges on its own. Only configure a proxy if you get TLS/connection errors:
 
 ```json
 {
@@ -56,12 +54,10 @@ Open `config.json` and set your proxy if you're in a region where Cloudflare blo
 }
 ```
 
-Common proxy setups:
-- **Hiddify / sing-box / v2ray** running locally: `"proxy": "http://127.0.0.1:12334"`
+Common setups:
+- **Hiddify / sing-box / v2ray**: `"proxy": "http://127.0.0.1:12334"`
 - **SOCKS5 proxy**: `"proxy": "socks5://127.0.0.1:1080"`
-- No proxy needed (rare): `"proxy": null` (default)
-
-> If you're unsure: try running without proxy first. If you get TLS/connection errors, set `"proxy"`.
+- Default (no proxy): `"proxy": null` — try this first
 
 ### 5. Run
 
@@ -139,12 +135,12 @@ curl -s -N -X POST http://localhost:8082/v1/chat/completions \
 **Cookies expired.** Re-export from Firefox. Claude.ai cookies last ~1 month.
 
 ### Q: TLS / connection errors / "OpenSSL error"
-Claude.ai is blocked by Cloudflare in most regions. You **need a proxy** — set `"proxy"` in config.json.
+Claude.ai is behind Cloudflare. If `curl_cffi` impersonation isn't enough in your region, set `"proxy"` in config.json to route through a proxy that can reach Claude.ai.
 
 ### Q: Requests hang / timeout
-1. Check your proxy is running
-2. Check cookies are fresh
-3. Increase `timeout` in your client config
+1. Check cookies are fresh (most common cause)
+2. Increase `timeout` in your client config
+3. If using a proxy, check it's running
 
 ### Q: Which model is used?
 Claude.ai selects the model automatically based on your subscription. Free accounts get limited models.
