@@ -263,8 +263,48 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
                         self._json(result)
                         return
             self._json({"error": "invalid action"}, 400)
+        elif path == "/api/cookies/paste/gemini" or path == "/api/cookies/paste/claude":
+            name = path.split("/")[-1]
+            self._handle_paste_cookies(name)
         else:
             self._json({"error": "not found"}, 404)
+
+    def _handle_paste_cookies(self, name):
+        try:
+            content_len = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(content_len).decode("utf-8", errors="replace")
+        except Exception:
+            self._json({"success": False, "message": "Failed to read request body"}, 400)
+            return
+
+        if not raw or len(raw) < 20:
+            self._json({"success": False, "message": "Empty or too short — paste the full cookie export."}, 400)
+            return
+
+        # Validate: must contain Netscape header or tab-separated lines
+        lines = raw.strip().split("\n")
+        valid_lines = 0
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 5 and parts[4].isdigit():
+                valid_lines += 1
+
+        if valid_lines < 2:
+            self._json({"success": False,
+                        "message": f"Only {valid_lines} valid cookies found. Need at least 2. "
+                                   f"Export using cookies.txt extension (Netscape format)."}, 400)
+            return
+
+        dst = GEMINI_COOKIE_FILE if name == "gemini" else CLAUDE_COOKIE_FILE
+        try:
+            with open(dst, "w") as f:
+                f.write(raw)
+            self._json({"success": True, "message": f"Saved {valid_lines} cookies to {dst}"})
+        except Exception as e:
+            self._json({"success": False, "message": f"Write error: {e}"}, 500)
 
     def _handle_cookies(self, name):
         script = GEMINI_COOKIE_SCRIPT if name == "gemini" else CLAUDE_COOKIE_SCRIPT
@@ -435,8 +475,30 @@ footer a:hover{color:#0f0}
     <p id="confirmMsg">Are you sure?</p>
     <div class="btn-group">
       <button class="btn" onclick="confirmAction(true)">> CONFIRM</button>
-      <button class="btn danger" onclick="confirmAction(false)">> CANCEL</button>
+      <button class="btn" onclick="confirmAction(false)">> CANCEL</button>
     </div>
+  </div>
+</div>
+
+<div id="pasteOverlay" class="confirm-overlay">
+  <div class="confirm-dialog" style="max-width:600px;width:90%">
+    <p id="pasteTitle">Paste cookies for <span id="pasteName">gemini</span></p>
+    <textarea id="pasteTextarea" style="width:100%;height:250px;background:#000;color:#0f0;border:1px solid #0a0;font-family:'Courier New',monospace;font-size:0.75em;padding:8px;resize:vertical;margin-bottom:12px" placeholder="Paste Netscape cookie format here...
+Copy from cookies.txt extension → Export → Ctrl+A → Ctrl+C → Ctrl+V here"></textarea>
+    <div style="font-size:0.75em;color:#080;margin-bottom:12px;text-align:left">
+      <strong>How to export cookies:</strong><br>
+      1. Install <strong>cookies.txt</strong> extension in Firefox<br>
+      2. Go to gemini.google.com (or claude.ai) — make sure you're logged in<br>
+      3. Click the extension icon → <strong>Export</strong><br>
+      4. Copy all text (Ctrl+A → Ctrl+C) and paste above (Ctrl+V)<br>
+      5. Click SAVE
+    </div>
+    <div class="btn-group">
+      <button class="btn" onclick="savePastedCookies()">> SAVE</button>
+      <button class="btn" onclick="closePasteOverlay()">> CANCEL</button>
+    </div>
+  </div>
+</div>
   </div>
 </div>
 
@@ -467,7 +529,8 @@ footer a:hover{color:#0f0}
     </div>
     <div class="actions">
       <button class="btn btn-sm" onclick="doAction('gemini','restart')">> RESTART</button>
-      <button class="btn btn-sm" onclick="doAction('gemini','cookies')">> COOKIES</button>
+      <button class="btn btn-sm" onclick="doAction('gemini','cookies')">> EXPORT</button>
+      <button class="btn btn-sm" onclick="openPaste('gemini')">> PASTE</button>
       <button class="btn btn-sm" onclick="doTest('gemini')">> TEST</button>
     </div>
     <div id="geminiTest" class="test-result">Press TEST to send a request</div>
@@ -486,7 +549,8 @@ footer a:hover{color:#0f0}
     </div>
     <div class="actions">
       <button class="btn btn-sm" onclick="doAction('claude','restart')">> RESTART</button>
-      <button class="btn btn-sm" onclick="doAction('claude','cookies')">> COOKIES</button>
+      <button class="btn btn-sm" onclick="doAction('claude','cookies')">> EXPORT</button>
+      <button class="btn btn-sm" onclick="openPaste('claude')">> PASTE</button>
       <button class="btn btn-sm" onclick="doTest('claude')">> TEST</button>
     </div>
     <div id="claudeTest" class="test-result">Press TEST to send a request</div>
@@ -504,7 +568,8 @@ footer a:hover{color:#0f0}
 <div class="section-title">// QUICK INFO</div>
 <p style="font-size:0.75em;color:#060;line-height:1.6">
   <strong style="color:#080">RESTART</strong> — kills the proxy process and starts a fresh one.<br>
-  <strong style="color:#080">COOKIES</strong> — opens Firefox to export fresh cookies (save to Downloads, then press Enter).<br>
+  <strong style="color:#080">EXPORT</strong> — opens Firefox to export fresh cookies via terminal script.<br>
+  <strong style="color:#080">PASTE</strong> — paste cookies directly from clipboard (cookies.txt extension → Export → Ctrl+C → Ctrl+V).<br>
   <strong style="color:#080">TEST</strong> — sends "say hi in 3 words" to the proxy and shows the response.<br>
   <strong style="color:#080">COOKIE EXPIRY</strong> — days until the earliest cookie in the file expires (based on expiry timestamps).
 </p>
@@ -685,6 +750,42 @@ async function doTest(name){
     div.className = 'test-result fail';
     div.textContent = `> FAIL (${result.time}s): ${result.response||'no response'}`;
   }
+}
+
+// ── Paste Cookies ──
+let pasteTarget = 'gemini';
+function openPaste(name){
+  pasteTarget = name;
+  document.getElementById('pasteName').textContent = name.toUpperCase();
+  document.getElementById('pasteTextarea').value = '';
+  document.getElementById('pasteOverlay').classList.add('show');
+  setTimeout(()=>document.getElementById('pasteTextarea').focus(), 100);
+}
+function closePasteOverlay(){
+  document.getElementById('pasteOverlay').classList.remove('show');
+}
+async function savePastedCookies(){
+  const textarea = document.getElementById('pasteTextarea');
+  const raw = textarea.value;
+  if(!raw || raw.length < 20){
+    showToast('Paste is too short — copy the full export from cookies.txt', true);
+    return;
+  }
+  textarea.disabled = true;
+  try{
+    const r = await fetch(`/api/cookies/paste/${pasteTarget}`, {method:'POST', body:raw});
+    const result = await r.json();
+    if(result.success){
+      showToast(`${pasteTarget} cookies saved (${result.message})`, false);
+      closePasteOverlay();
+      setTimeout(fetchStatus, 1000);
+    }else{
+      showToast(`Error: ${result.message}`, true);
+    }
+  }catch(e){
+    showToast(`Network error: ${e.message}`, true);
+  }
+  textarea.disabled = false;
 }
 
 // ── Auto Polling ──
