@@ -1,4 +1,4 @@
-<img src="preview.jpg" alt="Claude Web2API screenshot" style="max-width: 100%;">
+<img src="/cyberanrhy/claude-web2api/raw/main/preview.jpg" alt="Claude Web2API screenshot" style="max-width: 100%;">
 
 # Claude Web2API
 
