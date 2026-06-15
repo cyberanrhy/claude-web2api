@@ -434,10 +434,8 @@ h1{font-size:1.3em;margin-bottom:4px;color:#0f0;text-transform:uppercase;letter-
 
 .section-title{color:#0f0;font-size:0.9em;text-transform:uppercase;letter-spacing:2px;margin:20px 0 10px;border-bottom:1px solid #0f0;padding-bottom:4px}
 
-.log-box{background:#000;border:1px solid #0f0;padding:10px;font-size:0.72em;line-height:1.4;height:200px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;color:#0a0;margin-bottom:20px}
-.log-box .highlight{color:#0f0}
-.log-box .error{color:#f00}
-.log-box .warn{color:#fa0}
+.log-box{background:#000;border:1px solid #0a0;padding:8px;font-size:0.68em;line-height:1.3;height:240px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;color:#080}
+.log-box .bright{color:#0f0}
 
 .test-result{background:#000;border:1px solid #0f0;padding:10px;font-size:0.75em;margin-top:8px;min-height:20px}
 .test-result.success{border-color:#0f0}
@@ -558,12 +556,16 @@ Copy from cookies.txt extension → Export → Ctrl+A → Ctrl+C → Ctrl+V here
 </div>
 
 <div class="section-title">// LOGS</div>
-<div class="status-bar" style="margin-bottom:4px">
-  <button class="btn small" onclick="switchLog('gemini')">> gemini.log</button>
-  <button class="btn small" onclick="switchLog('claude')">> claude.log</button>
-  <span id="logLabel" style="color:#060">gemini.log</span>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px">
+  <div>
+    <div style="font-size:0.7em;color:#060;margin-bottom:4px">gemini.log</div>
+    <div class="log-box" id="geminiLogBox">Loading...</div>
+  </div>
+  <div>
+    <div style="font-size:0.7em;color:#060;margin-bottom:4px">claude.log</div>
+    <div class="log-box" id="claudeLogBox">Loading...</div>
+  </div>
 </div>
-<div class="log-box" id="logBox">Loading logs...</div>
 
 <div class="section-title">// QUICK INFO</div>
 <p style="font-size:0.75em;color:#060;line-height:1.6">
@@ -583,7 +585,6 @@ Copy from cookies.txt extension → Export → Ctrl+A → Ctrl+C → Ctrl+V here
 
 <script>
 // ── State ──
-let currentLog = 'gemini';
 let pendingAction = null;
 
 // ── Matrix Rain (optional, lightweight) ──
@@ -694,24 +695,17 @@ async function fetchStatus(){
 
 // ── Fetch Logs ──
 async function fetchLogs(){
-  const data = await api('GET', `/api/logs/${currentLog}`);
-  const box = document.getElementById('logBox');
-  if(data.error){
-    box.textContent='[error: '+data.error+']';
-    return;
+  for(const name of ['gemini','claude']){
+    const box = document.getElementById(name+'LogBox');
+    if(!box) continue;
+    const data = await api('GET', `/api/logs/${name}`);
+    if(data.log === null){
+      box.textContent = '[no log file]';
+    } else {
+      box.textContent = data.log || '[empty]';
+    }
+    box.scrollTop = box.scrollHeight;
   }
-  if(data.log === null){
-    box.textContent='[no log file — proxy may not have started or logging is disabled]';
-    return;
-  }
-  box.textContent = data.log || '[empty log]';
-  box.scrollTop = box.scrollHeight;
-}
-
-function switchLog(name){
-  currentLog = name;
-  document.getElementById('logLabel').textContent = name+'.log';
-  fetchLogs();
 }
 
 // ── Actions ──
@@ -791,8 +785,8 @@ async function savePastedCookies(){
 // ── Auto Polling ──
 fetchStatus();
 fetchLogs();
-setInterval(fetchStatus, 3000);
-setInterval(fetchLogs, 3000);
+setInterval(fetchStatus, 10000);
+setInterval(fetchLogs, 5000);
 </script>
 </body>
 </html>"""
