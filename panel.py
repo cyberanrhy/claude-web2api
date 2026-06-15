@@ -18,6 +18,7 @@ import urllib.error
 import threading
 from datetime import datetime
 from pathlib import Path
+from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
 
 # ── Config ──────────────────────────────────────────────────────────────
@@ -37,6 +38,12 @@ CLAUDE_COOKIE_SCRIPT = os.path.join(HOME, ".local", "bin", "claude-cookie-update
 
 GEMINI_COOKIE_FILE = os.path.join(GEMINI_DIR, "cookie.txt")
 CLAUDE_COOKIE_FILE = os.path.join(CLAUDE_DIR, "cookie_claude.txt")
+
+GEMINI_SCRIPT = os.path.join(GEMINI_DIR, "gemini_web2api.py")
+CLAUDE_SCRIPT = os.path.join(CLAUDE_DIR, "claude_web2api.py")
+
+GEMINI_REPO = "https://github.com/cyberanrhy/gemini-web2api.git"
+CLAUDE_REPO = "https://github.com/cyberanrhy/claude-web2api.git"
 
 VPN_HOST = "127.0.0.1"
 VPN_PORT = 12334
@@ -123,6 +130,89 @@ def count_proxy_process(port):
         return -1
 
 
+def is_installed(name):
+    script = GEMINI_SCRIPT if name == "gemini" else CLAUDE_SCRIPT
+    return os.path.exists(script)
+
+
+def install_proxy(name, force=False):
+    """Git clone the proxy repo and do initial setup.
+    If force=True, backup cookies+config, delete, re-clone, restore."""
+    repo_url = GEMINI_REPO if name == "gemini" else CLAUDE_REPO
+    dest_dir = GEMINI_DIR if name == "gemini" else CLAUDE_DIR
+    script = GEMINI_SCRIPT if name == "gemini" else CLAUDE_SCRIPT
+
+    if is_installed(name) and not force:
+        return {"success": True, "message": f"{name} is already installed at {dest_dir}"}
+
+    # Backup user data before deleting
+    backup = {}
+    if force and os.path.exists(dest_dir):
+        for fname in ["config.json", "cookie.txt", "cookie_claude.txt"]:
+            fpath = os.path.join(dest_dir, fname)
+            if os.path.exists(fpath):
+                try:
+                    with open(fpath) as f:
+                        backup[fname] = f.read()
+                except:
+                    pass
+
+    # Try with no proxy first, fallback to Hiddify
+    env = os.environ.copy()
+    env.pop("http_proxy", None)
+    env.pop("https_proxy", None)
+    env.pop("HTTP_PROXY", None)
+    env.pop("HTTPS_PROXY", None)
+
+    try:
+        # If force, remove existing dir before clone
+        if force and os.path.exists(dest_dir):
+            import shutil
+            shutil.rmtree(dest_dir, ignore_errors=True)
+
+        # Create parent dir if needed
+        os.makedirs(dest_dir, exist_ok=True)
+
+        proc = subprocess.run(
+            ["git", "clone", repo_url, dest_dir],
+            capture_output=True, text=True, timeout=60, env=env,
+        )
+        if proc.returncode != 0:
+            # Retry with Hiddify proxy
+            proc = subprocess.run(
+                ["git", "clone", repo_url, dest_dir],
+                capture_output=True, text=True, timeout=60,
+                env={**env, "http_proxy": f"http://{VPN_HOST}:{VPN_PORT}",
+                     "https_proxy": f"http://{VPN_HOST}:{VPN_PORT}"},
+            )
+            if proc.returncode != 0:
+                return {"success": False,
+                        "message": f"git clone failed: {proc.stderr[:300]}".strip()}
+
+        # Copy config from example if not exists
+        example = os.path.join(dest_dir, "config.json.example")
+        config = os.path.join(dest_dir, "config.json")
+        if os.path.exists(example) and not os.path.exists(config):
+            import shutil
+            shutil.copy(example, config)
+
+        # Restore user data (config, cookies) from backup
+        for fname, content in backup.items():
+            fpath = os.path.join(dest_dir, fname)
+            try:
+                with open(fpath, "w") as f:
+                    f.write(content)
+            except:
+                pass
+
+        # Restart proxy to pick up new code
+        restart_proxy(name)
+
+        return {"success": True, "message": f"Installed {name} from {repo_url}"}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
 def restart_proxy(name):
     """Kill and restart a proxy, redirecting output to log file."""
     port = GEMINI_PORT if name == "gemini" else CLAUDE_PORT
@@ -173,7 +263,7 @@ def run_health_test(name):
         "max_tokens": 10,
     }
     t0 = time.time()
-    status, body = http_post_json(url, payload, timeout=20)
+    status, body = http_post_json(url, payload, timeout=120)
     elapsed = round(time.time() - t0, 3)
 
     if status == 200:
@@ -204,7 +294,6 @@ def parse_cookie_expiry(filepath):
                         expiry = int(parts[4])
                         if expiry > now:
                             days = (expiry - now) / 86400
-                            name = parts[0] + "." + parts[5] if len(parts) > 5 else parts[0]
                             if min_days is None or days < min_days:
                                 min_days = days
                     except (ValueError, IndexError):
@@ -214,10 +303,102 @@ def parse_cookie_expiry(filepath):
         return None
 
 
+def read_config(name):
+    """Read proxy config.json and return proxy value."""
+    config_file = os.path.join(GEMINI_DIR if name == "gemini" else CLAUDE_DIR, "config.json")
+    if not os.path.exists(config_file):
+        return None
+    try:
+        with open(config_file) as f:
+            cfg = json.load(f)
+        return cfg.get("proxy")
+    except Exception:
+        return None
+
+
+def write_config(name, proxy_val):
+    """Write proxy value to config.json and restart the proxy."""
+    config_file = os.path.join(GEMINI_DIR if name == "gemini" else CLAUDE_DIR, "config.json")
+    if not os.path.exists(config_file):
+        return {"success": False, "message": "config.json not found"}
+    try:
+        with open(config_file) as f:
+            cfg = json.load(f)
+        if proxy_val is None:
+            cfg.pop("proxy", None)
+        else:
+            cfg["proxy"] = proxy_val
+        with open(config_file, "w") as f:
+            json.dump(cfg, f, indent=2)
+        restart_proxy(name)
+        return {"success": True, "message": "config saved, proxy restarted"}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+_upstream_cache = {}
+def check_upstream_access():
+    """Check if upstream (Google/Claude) is reachable via TCP 443.
+    Returns dict with direct/proxy status per target, 60s cache."""
+    now = time.time()
+    cached = _upstream_cache.get("result")
+    cached_at = _upstream_cache.get("at", 0)
+    if cached and now - cached_at < 60:
+        return cached
+
+    vpn_alive = check_vpn()
+
+    def tcp_test(host, via_proxy=False):
+        try:
+            if via_proxy and vpn_alive:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(3)
+                s.connect(("127.0.0.1", VPN_PORT))
+                s.sendall(f"CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n".encode())
+                resp = s.recv(4096, socket.MSG_PEEK)
+                s.close()
+                return resp.startswith(b"HTTP/") or b"200" in resp
+            else:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(3)
+                s.connect((host, 443))
+                s.close()
+                return True
+        except:
+            return False
+
+    targets = [("gemini.google.com", "gemini"), ("claude.ai", "claude")]
+    results = {}
+    for host, name in targets:
+        direct = tcp_test(host)
+        via_proxy = tcp_test(host, via_proxy=True) if vpn_alive else False
+        results[name] = {"direct": direct, "proxy": via_proxy}
+
+    _upstream_cache["result"] = results
+    _upstream_cache["at"] = now
+    return results
+
+
 # ── API & Web Handler ────────────────────────────────────────────────────
 
 class PanelHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        msg = fmt % args
+        if "GET /api" in msg or "POST /api" in msg:
+            return
+        log(msg)
+
     def do_GET(self):
+        try:
+            self._do_GET()
+        except Exception as e:
+            log(f"do_GET error: {e}")
+            try:
+                self._json({"error": f"internal error: {e}"}, 500)
+            except:
+                pass
+
+    def _do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
 
@@ -241,10 +422,29 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
                 self._json(result)
             else:
                 self._json({"error": "unknown proxy"}, 404)
+        elif path.startswith("/api/config/"):
+            name = path.split("/")[-1]
+            if name in ("gemini", "claude"):
+                proxy_val = read_config(name)
+                self._json({"name": name, "proxy": proxy_val})
+            else:
+                self._json({"error": "unknown proxy"}, 404)
+        elif path == "/api/upstream":
+            self._json(check_upstream_access())
         else:
             self._json({"error": "not found"}, 404)
 
     def do_POST(self):
+        try:
+            self._do_POST()
+        except Exception as e:
+            log(f"do_POST error: {e}")
+            try:
+                self._json({"error": f"internal error: {e}"}, 500)
+            except:
+                pass
+
+    def _do_POST(self):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
 
@@ -255,17 +455,45 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
                 action = parts[4]
                 if name in ("gemini", "claude"):
                     if action == "restart":
+                        if not is_installed(name):
+                            self._json({"success": False, "message": "not installed"}, 400)
+                            return
                         result = restart_proxy(name)
                         self._json(result)
                         return
                     elif action == "cookies":
+                        if not is_installed(name):
+                            self._json({"success": False, "message": "not installed"}, 400)
+                            return
                         result = self._handle_cookies(name)
+                        self._json(result)
+                        return
+                    elif action == "install":
+                        result = install_proxy(name)
+                        self._json(result)
+                        return
+                    elif action == "reinstall":
+                        result = install_proxy(name, force=True)
                         self._json(result)
                         return
             self._json({"error": "invalid action"}, 400)
         elif path == "/api/cookies/paste/gemini" or path == "/api/cookies/paste/claude":
             name = path.split("/")[-1]
             self._handle_paste_cookies(name)
+            return
+        elif path.startswith("/api/config/"):
+            name = path.split("/")[-1]
+            if name in ("gemini", "claude"):
+                try:
+                    content_len = int(self.headers.get("Content-Length", 0))
+                    body = json.loads(self.rfile.read(content_len))
+                    proxy_val = body.get("proxy")  # None or string URL
+                    result = write_config(name, proxy_val)
+                    self._json(result)
+                except Exception as e:
+                    self._json({"success": False, "message": str(e)}, 400)
+            else:
+                self._json({"error": "unknown proxy"}, 404)
         else:
             self._json({"error": "not found"}, 404)
 
@@ -327,8 +555,11 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
             }
 
     def _get_status(self):
-        gemini_alive = check_port(GEMINI_PORT)
-        claude_alive = check_port(CLAUDE_PORT)
+        gemini_installed = is_installed("gemini")
+        claude_installed = is_installed("claude")
+
+        gemini_alive = check_port(GEMINI_PORT) if gemini_installed else False
+        claude_alive = check_port(CLAUDE_PORT) if claude_installed else False
         vpn_alive = check_vpn()
 
         gemini_rt = None
@@ -348,20 +579,27 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
         gemini_cookie_expiry = parse_cookie_expiry(GEMINI_COOKIE_FILE)
         claude_cookie_expiry = parse_cookie_expiry(CLAUDE_COOKIE_FILE)
 
+        gemini_proxy = read_config("gemini")
+        claude_proxy = read_config("claude")
+
         return {
             "gemini": {
                 "alive": gemini_alive,
+                "installed": gemini_installed,
                 "port": GEMINI_PORT,
                 "response_time": gemini_rt,
                 "cookie_expiry_days": gemini_cookie_expiry,
                 "log_exists": os.path.exists(GEMINI_LOG),
+                "proxy": gemini_proxy,
             },
             "claude": {
                 "alive": claude_alive,
+                "installed": claude_installed,
                 "port": CLAUDE_PORT,
                 "response_time": claude_rt,
                 "cookie_expiry_days": claude_cookie_expiry,
                 "log_exists": os.path.exists(CLAUDE_LOG),
+                "proxy": claude_proxy,
             },
             "vpn": {"alive": vpn_alive, "port": VPN_PORT},
         }
@@ -423,6 +661,10 @@ h1{font-size:1.3em;margin-bottom:4px;color:#0f0;text-transform:uppercase;letter-
 .card-body .value.warn{color:#fa0}
 .card-body .value.critical{color:#f00}
 .actions{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+.installed-actions{display:flex;gap:8px;flex-wrap:wrap}
+.missing-actions{display:none;gap:8px;flex-wrap:wrap}
+.btn[title]{position:relative}
+.btn[title]:hover::after{content:attr(title);position:absolute;bottom:calc(100% + 4px);left:50%;transform:translateX(-50%);background:#000;color:#0f0;border:1px solid #0f0;padding:4px 8px;font-size:0.65em;white-space:nowrap;z-index:10;pointer-events:none}
 .btn{background:transparent;border:1px solid #0f0;color:#0f0;padding:6px 14px;cursor:pointer;font-family:inherit;font-size:0.78em;transition:all 0.2s}
 .btn:hover{background:#0f0;color:#000;box-shadow:0 0 6px #0f0}
 .btn.danger{border-color:#f00;color:#f00}
@@ -470,30 +712,33 @@ footer a:hover{color:#0f0}
 
 <div id="confirmOverlay" class="confirm-overlay">
   <div class="confirm-dialog">
-    <p id="confirmMsg">Are you sure?</p>
+    <p id="confirmMsg" data-i18n="confirm_restart">Are you sure?</p>
     <div class="btn-group">
-      <button class="btn" onclick="confirmAction(true)">> CONFIRM</button>
-      <button class="btn" onclick="confirmAction(false)">> CANCEL</button>
+      <button class="btn" onclick="confirmAction(true)">&gt; <span data-i18n="btn_confirm">CONFIRM</span></button>
+      <button class="btn" onclick="confirmAction(false)">&gt; <span data-i18n="btn_cancel">CANCEL</span></button>
     </div>
   </div>
 </div>
 
 <div id="pasteOverlay" class="confirm-overlay">
   <div class="confirm-dialog" style="max-width:600px;width:90%">
-    <p id="pasteTitle">Paste cookies for <span id="pasteName">gemini</span></p>
-    <textarea id="pasteTextarea" style="width:100%;height:250px;background:#000;color:#0f0;border:1px solid #0a0;font-family:'Courier New',monospace;font-size:0.75em;padding:8px;resize:vertical;margin-bottom:12px" placeholder="Paste Netscape cookie format here...
-Copy from cookies.txt extension → Export → Ctrl+A → Ctrl+C → Ctrl+V here"></textarea>
-    <div style="font-size:0.75em;color:#080;margin-bottom:12px;text-align:left">
-      <strong>How to export cookies:</strong><br>
-      1. Install <strong>cookies.txt</strong> extension in Firefox<br>
-      2. Go to gemini.google.com (or claude.ai) — make sure you're logged in<br>
-      3. Click the extension icon → <strong>Export</strong><br>
-      4. Copy all text (Ctrl+A → Ctrl+C) and paste above (Ctrl+V)<br>
-      5. Click SAVE
+    <p style="font-size:1.1em;margin-bottom:8px">📋 <span data-i18n="paste_title">PASTE COOKIES</span>: <span id="pasteName" style="color:#0f0">gemini</span></p>
+    <p id="pasteDesc" data-i18n="paste_desc1" style="font-size:0.75em;color:#060;margin-bottom:8px">
+      Paste Netscape cookie format below (tab-separated).<br>
+      Firefox → <strong>cookies.txt</strong> extension → Export → Ctrl+A → Ctrl+C → Ctrl+V ↓
+    </p>
+    <textarea id="pasteTextarea" style="width:100%;height:200px;background:#000;color:#0f0;border:1px solid #0a0;font-family:'Courier New',monospace;font-size:0.7em;padding:8px;resize:vertical;margin-bottom:8px" placeholder=".gemini.google.com	TRUE	/	FALSE	1767225600	name	value"></textarea>
+    <div id="pasteHowto" style="font-size:0.7em;color:#060;margin-bottom:8px;text-align:left;background:rgba(0,255,0,0.03);padding:8px;border:1px solid #0a0">
+      <strong data-i18n="paste_howto_title" style="color:#080">How to export cookies:</strong><br>
+      <span data-i18n="paste_step1">1. Install <strong>cookies.txt</strong> extension in Firefox</span><br>
+      <span data-i18n="paste_step2">2. Go to gemini.google.com (or claude.ai) — make sure you're logged in</span><br>
+      <span data-i18n="paste_step3">3. Click the extension icon → <strong>Export</strong></span><br>
+      <span data-i18n="paste_step4">4. Copy all text (Ctrl+A → Ctrl+C) and paste above (Ctrl+V)</span><br>
+      <span data-i18n="paste_step5">5. Click <strong>SAVE</strong></span>
     </div>
     <div class="btn-group">
-      <button class="btn" onclick="savePastedCookies()">> SAVE</button>
-      <button class="btn" onclick="closePasteOverlay()">> CANCEL</button>
+      <button class="btn" onclick="savePastedCookies()">&gt; <span data-i18n="btn_save">SAVE</span> ✓</button>
+      <button class="btn" onclick="closePasteOverlay()">&gt; <span data-i18n="btn_cancel">CANCEL</span> ✕</button>
     </div>
   </div>
 </div>
@@ -502,15 +747,30 @@ Copy from cookies.txt extension → Export → Ctrl+A → Ctrl+C → Ctrl+V here
 
 <div id="toast" class="toast"></div>
 
-<h1>// PROXY CONTROL PANEL</h1>
+<div id="howToUse" style="text-align:center;font-size:0.9em;color:#0a0;margin-bottom:16px;line-height:1.6;border:1px solid #0a0;padding:12px;background:rgba(0,255,0,0.03)">
+  <strong data-i18n="howto_title">// HOW TO USE</strong><br>
+  <strong style="color:#0f0">RESTART</strong>&nbsp;<span data-i18n="howto_restart">restart the proxy</span> &nbsp;|&nbsp;
+  <strong style="color:#0f0">EXPORT</strong>&nbsp;<span data-i18n="howto_export">Firefox → export cookies to terminal</span> &nbsp;|&nbsp;
+  <strong style="color:#0f0">PASTE</strong>&nbsp;<span data-i18n="howto_paste">paste cookies from clipboard</span> &nbsp;|&nbsp;
+  <strong style="color:#0f0">TEST</strong>&nbsp;<span data-i18n="howto_test">check if proxy responds</span><br>
+  <span style="color:#060"><span data-i18n="status_legend">STATUS — 🟢 alive / 🔴 dead</span> &nbsp;|&nbsp; <span data-i18n="cookie_legend">COOKIE EXPIRY — days until cookies expire</span></span>
+</div>
+
+<h1><span data-i18n="panel_title">// PROXY CONTROL PANEL</span></h1>
 <div class="sub">[ system v1.0 ] — gemini-web2api + claude-web2api</div>
 
 <div class="status-bar">
-  <span id="vpnStatus"><span class="indicator unknown" style="width:6px;height:6px"></span> VPN checking...</span>
+  <span id="vpnStatus"><span class="indicator unknown" style="width:6px;height:6px"></span> <span data-i18n="vpn_checking">VPN checking...</span></span>
   <span id="timeDisplay">--:--:--</span>
   <span>|</span>
   <span><a href="https://github.com/cyberanrhy/gemini-web2api" target="_blank" style="color:#080">gemini-web2api</a></span>
   <span><a href="https://github.com/cyberanrhy/claude-web2api" target="_blank" style="color:#080">claude-web2api</a></span>
+  <span>|</span>
+  <span><button id="langSwitch" onclick="toggleLang()" style="background:none;border:1px solid #0a0;color:#0f0;cursor:pointer;font-family:inherit;font-size:0.8em;padding:2px 6px">RU</button></span>
+</div>
+
+<div id="proxyWarning" style="display:none;background:#330;border:1px solid #fa0;color:#fa0;padding:8px 12px;margin-bottom:16px;font-size:0.75em">
+  ⚠ <span data-i18n="proxy_warning">Proxy is enabled but VPN is offline — upstream may be blocked</span>
 </div>
 
 <div class="panel-grid">
@@ -521,17 +781,25 @@ Copy from cookies.txt extension → Export → Ctrl+A → Ctrl+C → Ctrl+V here
     </div>
     <div class="card-body" id="geminiBody">
       <div class="row"><span class="label">PORT</span><span class="value">8081</span></div>
-      <div class="row"><span class="label">STATUS</span><span class="value" id="geminiStatus">scanning...</span></div>
-      <div class="row"><span class="label">RESPONSE TIME</span><span class="value" id="geminiRT">--</span></div>
-      <div class="row"><span class="label">COOKIE EXPIRY</span><span class="value" id="geminiCookies">--</span></div>
+      <div class="row"><span class="label" data-i18n="label_status">STATUS</span><span class="value" id="geminiStatus"><span data-i18n="scanning">scanning...</span></span></div>
+      <div class="row"><span class="label" data-i18n="label_rt">RESPONSE TIME</span><span class="value" id="geminiRT">--</span></div>
+      <div class="row"><span class="label" data-i18n="label_cookies">COOKIE EXPIRY</span><span class="value" id="geminiCookies">--</span></div>
+      <div class="row"><span class="label" data-i18n="label_upstream">UPSTREAM</span><span class="value" id="geminiUpstream">--</span></div>
+      <div class="row"><span class="label" data-i18n="label_proxy">PROXY</span><span class="value" id="geminiProxyRow"><span id="geminiProxyToggle" style="cursor:pointer"></span> <input id="geminiProxyUrl" type="text" style="background:#000;color:#0f0;border:1px solid #0a0;width:180px;font-family:inherit;font-size:0.85em;padding:1px 4px" placeholder="http://..."> <button class="btn small" onclick="saveProxy('gemini')" data-i18n-title="title_save_proxy">SAVE</button></span></div>
     </div>
-    <div class="actions">
-      <button class="btn btn-sm" onclick="doAction('gemini','restart')">> RESTART</button>
-      <button class="btn btn-sm" onclick="doAction('gemini','cookies')">> EXPORT</button>
-      <button class="btn btn-sm" onclick="openPaste('gemini')">> PASTE</button>
-      <button class="btn btn-sm" onclick="doTest('gemini')">> TEST</button>
+    <div class="actions" id="geminiActions">
+      <div class="installed-actions" id="geminiInstalled">
+        <button class="btn btn-sm" onclick="doAction('gemini','restart')" data-i18n-title="title_restart">&gt; <span data-i18n="btn_restart">RESTART</span></button>
+        <button class="btn btn-sm" onclick="doAction('gemini','cookies')" data-i18n-title="title_export">&gt; <span data-i18n="btn_export">EXPORT</span></button>
+        <button class="btn btn-sm" onclick="openPaste('gemini')" data-i18n-title="title_paste">&gt; <span data-i18n="btn_paste">PASTE</span></button>
+        <button class="btn btn-sm" onclick="doTest('gemini')" data-i18n-title="title_test">[ <span data-i18n="btn_test">TEST</span> ]</button>
+        <button class="btn btn-sm" onclick="doAction('gemini','install')" data-i18n-title="title_reinstall">&gt; <span data-i18n="btn_reinstall">REINSTALL</span></button>
+      </div>
+      <div class="missing-actions" id="geminiMissing">
+        <button class="btn btn-sm" onclick="doAction('gemini','install')">&gt; <span data-i18n="btn_install">INSTALL</span></button>
+      </div>
     </div>
-    <div id="geminiTest" class="test-result">Press TEST to send a request</div>
+    <div id="geminiTest" class="test-result"><span style="color:#060" data-i18n="test_hint">TEST sends "say hi in 3 words" and shows the response</span></div>
   </div>
 
   <div class="card claude" id="claudeCard">
@@ -541,39 +809,53 @@ Copy from cookies.txt extension → Export → Ctrl+A → Ctrl+C → Ctrl+V here
     </div>
     <div class="card-body" id="claudeBody">
       <div class="row"><span class="label">PORT</span><span class="value">8082</span></div>
-      <div class="row"><span class="label">STATUS</span><span class="value" id="claudeStatus">scanning...</span></div>
-      <div class="row"><span class="label">RESPONSE TIME</span><span class="value" id="claudeRT">--</span></div>
-      <div class="row"><span class="label">COOKIE EXPIRY</span><span class="value" id="claudeCookies">--</span></div>
+      <div class="row"><span class="label" data-i18n="label_status">STATUS</span><span class="value" id="claudeStatus"><span data-i18n="scanning">scanning...</span></span></div>
+      <div class="row"><span class="label" data-i18n="label_rt">RESPONSE TIME</span><span class="value" id="claudeRT">--</span></div>
+      <div class="row"><span class="label" data-i18n="label_cookies">COOKIE EXPIRY</span><span class="value" id="claudeCookies">--</span></div>
+      <div class="row"><span class="label" data-i18n="label_upstream">UPSTREAM</span><span class="value" id="claudeUpstream">--</span></div>
+      <div class="row"><span class="label" data-i18n="label_proxy">PROXY</span><span class="value" id="claudeProxyRow"><span id="claudeProxyToggle" style="cursor:pointer"></span> <input id="claudeProxyUrl" type="text" style="background:#000;color:#0f0;border:1px solid #0a0;width:180px;font-family:inherit;font-size:0.85em;padding:1px 4px" placeholder="http://..."> <button class="btn small" onclick="saveProxy('claude')" data-i18n-title="title_save_proxy">SAVE</button></span></div>
     </div>
-    <div class="actions">
-      <button class="btn btn-sm" onclick="doAction('claude','restart')">> RESTART</button>
-      <button class="btn btn-sm" onclick="doAction('claude','cookies')">> EXPORT</button>
-      <button class="btn btn-sm" onclick="openPaste('claude')">> PASTE</button>
-      <button class="btn btn-sm" onclick="doTest('claude')">> TEST</button>
+    <div class="actions" id="claudeActions">
+      <div class="installed-actions" id="claudeInstalled">
+        <button class="btn btn-sm" onclick="doAction('claude','restart')" data-i18n-title="title_restart">&gt; <span data-i18n="btn_restart">RESTART</span></button>
+        <button class="btn btn-sm" onclick="doAction('claude','cookies')" data-i18n-title="title_export">&gt; <span data-i18n="btn_export">EXPORT</span></button>
+        <button class="btn btn-sm" onclick="openPaste('claude')" data-i18n-title="title_paste">&gt; <span data-i18n="btn_paste">PASTE</span></button>
+        <button class="btn btn-sm" onclick="doTest('claude')" data-i18n-title="title_test">[ <span data-i18n="btn_test">TEST</span> ]</button>
+        <button class="btn btn-sm" onclick="doAction('claude','install')" data-i18n-title="title_reinstall">&gt; <span data-i18n="btn_reinstall">REINSTALL</span></button>
+      </div>
+      <div class="missing-actions" id="claudeMissing">
+        <button class="btn btn-sm" onclick="doAction('claude','install')">&gt; <span data-i18n="btn_install">INSTALL</span></button>
+      </div>
     </div>
-    <div id="claudeTest" class="test-result">Press TEST to send a request</div>
+    <div id="claudeTest" class="test-result"><span style="color:#060" data-i18n="test_hint">TEST sends "say hi in 3 words" and shows the response</span></div>
   </div>
 </div>
 
-<div class="section-title">// LOGS</div>
+<div class="section-title" data-i18n="section_logs">// LOGS</div>
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px">
   <div>
     <div style="font-size:0.7em;color:#060;margin-bottom:4px">gemini.log</div>
-    <div class="log-box" id="geminiLogBox">Loading...</div>
+    <div class="log-box" id="geminiLogBox"><span data-i18n="loading">Loading...</span></div>
   </div>
   <div>
     <div style="font-size:0.7em;color:#060;margin-bottom:4px">claude.log</div>
-    <div class="log-box" id="claudeLogBox">Loading...</div>
+    <div class="log-box" id="claudeLogBox"><span data-i18n="loading">Loading...</span></div>
   </div>
 </div>
 
-<div class="section-title">// QUICK INFO</div>
-<p style="font-size:0.75em;color:#060;line-height:1.6">
-  <strong style="color:#080">RESTART</strong> — kills the proxy process and starts a fresh one.<br>
-  <strong style="color:#080">EXPORT</strong> — opens Firefox to export fresh cookies via terminal script.<br>
-  <strong style="color:#080">PASTE</strong> — paste cookies directly from clipboard (cookies.txt extension → Export → Ctrl+C → Ctrl+V).<br>
-  <strong style="color:#080">TEST</strong> — sends "say hi in 3 words" to the proxy and shows the response.<br>
-  <strong style="color:#080">COOKIE EXPIRY</strong> — days until the earliest cookie in the file expires (based on expiry timestamps).
+<div class="section-title" data-i18n="section_quickinfo">// QUICK INFO</div>
+<p style="font-size:0.75em;color:#060;line-height:1.8">
+  <strong style="color:#0f0">RESTART</strong> — <span data-i18n="qi_restart">kill & restart the proxy process</span>.<br>
+  <strong style="color:#0f0">EXPORT</strong> — <span data-i18n="qi_export">open Firefox → export fresh cookies via terminal script (requires Firefox + cookies.txt)</span>.<br>
+  <strong style="color:#0f0">PASTE</strong> — <span data-i18n="qi_paste">paste cookies from clipboard. cookies.txt → Export → Ctrl+A → Ctrl+C → Ctrl+V → SAVE</span>.<br>
+  <strong style="color:#0f0">TEST</strong> — <span data-i18n="qi_test">send test request ("say hi in 3 words") and show response + time</span>.<br>
+  <strong style="color:#0f0">COOKIE EXPIRY</strong> — <span data-i18n="qi_cookie_expiry">days until the earliest cookie expires (0 = update now)</span>.<br>
+  <strong style="color:#0f0">STATUS</strong> — <span data-i18n="qi_status">🟢 alive / 🔴 dead / 🟡 checking...</span><br>
+  <strong style="color:#0f0">RESPONSE TIME</strong> — <span data-i18n="qi_rt">how many ms the proxy took to respond (lower is better)</span>.<br>
+  <strong style="color:#0f0">VPN</strong> — <span data-i18n="qi_vpn">checks if Hiddify (127.0.0.1:12334) is running</span>.
+</p>
+<p style="font-size:0.7em;color:#040;margin-top:8px">
+  <em data-i18n="qi_tip">Tip: if the proxy is 🔴, try RESTART or update cookies via PASTE / EXPORT.</em>
 </p>
 
 <footer>
@@ -581,9 +863,206 @@ Copy from cookies.txt extension → Export → Ctrl+A → Ctrl+C → Ctrl+V here
   &middot;
   <a href="https://github.com/cyberanrhy/claude-web2api">claude-web2api</a>
   &middot; Proxy Control Panel v1.0
+  &middot; <span style="color:#060" data-i18n="footer_refresh">F5 — refresh status</span>
 </footer>
 
 <script>
+// ── Internationalization ──
+const LANG = {
+  en: {
+    lang_switch: 'RU',
+    confirm_restart: 'This will temporarily interrupt the proxy (1-2 seconds). Continue?',
+    btn_confirm: 'CONFIRM',
+    btn_cancel: 'CANCEL',
+    paste_title: 'PASTE COOKIES',
+    paste_desc1: 'Paste Netscape cookie format below (tab-separated).<br>Firefox → <strong>cookies.txt</strong> extension → Export → Ctrl+A → Ctrl+C → Ctrl+V ↓',
+    paste_howto_title: 'How to export cookies:',
+    paste_step1: '1. Install <strong>cookies.txt</strong> extension in Firefox',
+    paste_step2: '2. Go to gemini.google.com (or claude.ai) — make sure you\'re logged in',
+    paste_step3: '3. Click the extension icon → <strong>Export</strong>',
+    paste_step4: '4. Copy all text (Ctrl+A → Ctrl+C) and paste above (Ctrl+V)',
+    paste_step5: '5. Click <strong>SAVE</strong>',
+    btn_save: 'SAVE',
+    howto_title: '// HOW TO USE',
+    howto_restart: 'restart the proxy',
+    howto_export: 'Firefox → export cookies to terminal',
+    howto_paste: 'paste cookies from clipboard',
+    howto_test: 'check if proxy responds',
+    status_legend: 'STATUS — 🟢 alive / 🔴 dead',
+    cookie_legend: 'COOKIE EXPIRY — days until cookies expire',
+    panel_title: '// PROXY CONTROL PANEL',
+    vpn_checking: 'VPN checking...',
+    label_status: 'STATUS',
+    label_rt: 'RESPONSE TIME',
+    label_cookies: 'COOKIE EXPIRY',
+    scanning: 'scanning...',
+    title_restart: 'Kill & restart the proxy process',
+    title_export: 'Open Firefox to export cookies to terminal',
+    title_paste: 'Paste cookies from clipboard (Netscape format)',
+    title_test: 'Send "say hi" to check if proxy responds',
+    btn_restart: 'RESTART',
+    btn_export: 'EXPORT',
+    btn_paste: 'PASTE',
+    btn_test: 'TEST',
+    btn_install: 'INSTALL',
+    btn_reinstall: 'REINSTALL',
+    title_reinstall: 'Reinstall from GitHub (overwrites local changes)',
+    not_installed: 'NOT INSTALLED',
+    test_hint: 'TEST sends "say hi in 3 words" and shows the response',
+    section_logs: '// LOGS',
+    loading: 'Loading...',
+    section_quickinfo: '// QUICK INFO',
+    qi_restart: 'kill & restart the proxy process',
+    qi_export: 'open Firefox → export fresh cookies via terminal script (requires Firefox + cookies.txt)',
+    qi_paste: 'paste cookies from clipboard. cookies.txt → Export → Ctrl+A → Ctrl+C → Ctrl+V → SAVE',
+    qi_test: 'send test request ("say hi in 3 words") and show response + time',
+    qi_cookie_expiry: 'days until the earliest cookie expires (0 = update now)',
+    qi_status: '🟢 alive / 🔴 dead / 🟡 checking...',
+    qi_rt: 'how many ms the proxy took to respond (lower is better)',
+    qi_vpn: 'checks if Hiddify (127.0.0.1:12334) is running',
+    qi_tip: 'Tip: if the proxy is 🔴, try RESTART or update cookies via PASTE / EXPORT.',
+    footer_refresh: 'F5 — refresh status',
+    online: 'ONLINE',
+    offline: 'OFFLINE',
+    checking: 'checking...',
+    days: 'days',
+    unknown: 'unknown',
+    vpn_online: 'ONLINE',
+    vpn_offline: 'OFFLINE',
+    toast_paste_short: 'Paste is too short — copy the full export from cookies.txt',
+    toast_saved: 'cookies saved',
+    toast_error: 'Error',
+    toast_network: 'Network error',
+    toast_status: 'Status error',
+    prompt_restart: 'The proxy will be interrupted for 1-2 seconds.',
+    sending: 'sending request...',
+    ok: 'OK',
+    fail: 'FAIL',
+    no_response: 'no response',
+    no_log: '[no log file]',
+    empty: '[empty]',
+    label_upstream: 'UPSTREAM',
+    label_proxy: 'PROXY',
+    proxy_off: 'proxy OFF',
+    proxy_saved: 'proxy config saved',
+    proxy_no_url: 'Enter a proxy URL first',
+    proxy_warning: 'Proxy is enabled but VPN is offline — upstream may be blocked',
+    title_save_proxy: 'Save proxy URL and restart',
+    upstream_direct: 'Direct',
+    upstream_vpn: 'Via VPN',
+    upstream_blocked: 'Blocked',
+  },
+  ru: {
+    lang_switch: 'EN',
+    confirm_restart: 'Прокси временно прервётся (на 1-2 секунды). Продолжить?',
+    btn_confirm: 'ПОДТВЕРДИТЬ',
+    btn_cancel: 'ОТМЕНА',
+    paste_title: 'ВСТАВИТЬ КУКИ',
+    paste_desc1: 'Вставь сюда куки из буфера (Netscape формат — строки с табами).<br>Firefox → расширение <strong>cookies.txt</strong> → Export → Ctrl+A → Ctrl+C → Ctrl+V ↓',
+    paste_howto_title: 'Как получить куки:',
+    paste_step1: '1. Установи расширение <strong>cookies.txt</strong> в Firefox',
+    paste_step2: '2. Зайди на gemini.google.com (или claude.ai) — ты должен быть залогинен',
+    paste_step3: '3. Нажми на иконку расширения → <strong>Export</strong>',
+    paste_step4: '4. Выдели всё (Ctrl+A) → скопируй (Ctrl+C) → вставь выше (Ctrl+V)',
+    paste_step5: '5. Нажми <strong>SAVE</strong>',
+    btn_save: 'СОХРАНИТЬ',
+    howto_title: '// КАК ПОЛЬЗОВАТЬСЯ',
+    howto_restart: 'перезапустить прокси',
+    howto_export: 'Firefox → экспорт кук в терминал',
+    howto_paste: 'вставить куки из буфера',
+    howto_test: 'проверить, отвечает ли прокси',
+    status_legend: 'СТАТУС — 🟢 живо / 🔴 умерло',
+    cookie_legend: 'COOKIE EXPIRY — через сколько дней протухнут куки',
+    panel_title: '// ПАНЕЛЬ УПРАВЛЕНИЯ ПРОКСИ',
+    vpn_checking: 'Проверка VPN...',
+    label_status: 'СТАТУС',
+    label_rt: 'ВРЕМЯ ОТВЕТА',
+    label_cookies: 'СРОК КУК',
+    scanning: 'сканирование...',
+    title_restart: 'Убить и перезапустить прокси',
+    title_export: 'Открыть Firefox для экспорта кук в терминал',
+    title_paste: 'Вставить куки из буфера (Netscape формат)',
+    title_test: 'Отправить "say hi" для проверки прокси',
+    btn_restart: 'ПЕРЕЗАПУСК',
+    btn_export: 'ЭКСПОРТ',
+    btn_paste: 'ВСТАВИТЬ',
+    btn_test: 'ТЕСТ',
+    btn_install: 'УСТАНОВИТЬ',
+    btn_reinstall: 'ПЕРЕУСТАНОВИТЬ',
+    title_reinstall: 'Переустановить с GitHub (перезапишет локальные изменения)',
+    not_installed: 'НЕ УСТАНОВЛЕН',
+    test_hint: 'ТЕСТ отправляет "say hi in 3 words" и показывает ответ',
+    section_logs: '// ЛОГИ',
+    loading: 'Загрузка...',
+    section_quickinfo: '// ПОДСКАЗКИ',
+    qi_restart: 'перезапустить прокси (убить процесс и запустить заново)',
+    qi_export: 'открыть Firefox → экспортировать свежие куки через терминальный скрипт (нужен Firefox с cookies.txt)',
+    qi_paste: 'вставить куки из буфера обмена. cookies.txt → Export → Ctrl+A → Ctrl+C → Ctrl+V → SAVE',
+    qi_test: 'отправить тестовый запрос ("say hi in 3 words") и показать ответ + время',
+    qi_cookie_expiry: 'через сколько дней протухнут самые старые куки (0 = пора обновлять)',
+    qi_status: '🟢 живо / 🔴 не отвечает / 🟡 проверка...',
+    qi_rt: 'сколько миллисекунд ждал ответ (чем меньше, тем лучше)',
+    qi_vpn: 'проверка, работает ли Hiddify (127.0.0.1:12334)',
+    qi_tip: 'Если прокси не отвечает (🔴), попробуй ПЕРЕЗАПУСК или обнови куки через ВСТАВИТЬ / ЭКСПОРТ.',
+    footer_refresh: 'F5 — обновить статус',
+    online: 'РАБОТАЕТ',
+    offline: 'НЕ ОТВЕЧАЕТ',
+    checking: 'проверка...',
+    days: 'дн.',
+    unknown: 'неизвестно',
+    vpn_online: 'РАБОТАЕТ',
+    vpn_offline: 'НЕ РАБОТАЕТ',
+    toast_paste_short: 'Слишком коротко — скопируй полный экспорт из cookies.txt',
+    toast_saved: 'куки сохранены',
+    toast_error: 'Ошибка',
+    toast_network: 'Ошибка сети',
+    toast_status: 'Ошибка статуса',
+    prompt_restart: 'Прокси временно прервётся (на 1-2 секунды).',
+    sending: 'отправка запроса...',
+    ok: 'OK',
+    fail: 'ОШИБКА',
+    no_response: 'нет ответа',
+    no_log: '[нет лог-файла]',
+    empty: '[пусто]',
+    label_upstream: 'АПСТРИМ',
+    label_proxy: 'ПРОКСИ',
+    proxy_off: 'прокси ВЫКЛ',
+    proxy_saved: 'настройки прокси сохранены',
+    proxy_no_url: 'Сначала введи URL прокси',
+    proxy_warning: 'Прокси включён, но VPN не работает — апстрим может быть заблокирован',
+    title_save_proxy: 'Сохранить URL прокси и перезапустить',
+    upstream_direct: 'Напрямую',
+    upstream_vpn: 'Через VPN',
+    upstream_blocked: 'Заблокирован',
+  }
+};
+
+let currentLang = localStorage.getItem('panel_lang') || 'en';
+document.getElementById('langSwitch').textContent = LANG[currentLang].lang_switch;
+
+function t(key){
+  return LANG[currentLang][key] || key;
+}
+
+function applyLang(){
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const key = el.getAttribute('data-i18n');
+    el.innerHTML = t(key);
+  });
+  document.querySelectorAll('[data-i18n-title]').forEach(el => {
+    const key = el.getAttribute('data-i18n-title');
+    el.title = t(key);
+  });
+  document.getElementById('langSwitch').textContent = t('lang_switch');
+}
+
+function toggleLang(){
+  currentLang = currentLang === 'en' ? 'ru' : 'en';
+  localStorage.setItem('panel_lang', currentLang);
+  applyLang();
+  fetchStatus();
+}
+
 // ── State ──
 let pendingAction = null;
 
@@ -649,7 +1128,17 @@ async function api(method, path, body){
 // ── Fetch Status ──
 async function fetchStatus(){
   const data = await api('GET', '/api/status');
-  if(data.error){ showToast('Status error: '+data.error, true); return; }
+  if(data.error){ showToast(t('toast_status')+': '+data.error, true); return; }
+  
+  // Check proxy warning
+  let showWarning = false;
+  for(const name of ['gemini','claude']){
+    const s = data[name];
+    if(!s) continue;
+    if(s.proxy && s.proxy !== null && !data.vpn.alive) showWarning = true;
+  }
+  const pw = document.getElementById('proxyWarning');
+  if(pw) pw.style.display = showWarning ? 'block' : 'none';
   
   for(const name of ['gemini','claude']){
     const s = data[name];
@@ -658,36 +1147,104 @@ async function fetchStatus(){
     const st = document.getElementById(name+'Status');
     const rt = document.getElementById(name+'RT');
     const ck = document.getElementById(name+'Cookies');
+    const installedDiv = document.getElementById(name+'Installed');
+    const missingDiv = document.getElementById(name+'Missing');
     
-    if(s.alive){
+    if(!s.installed){
+      ind.className='indicator unknown';
+      st.textContent=t('not_installed');
+      st.style.color='#060';
+      rt.textContent='--';
+      ck.textContent='--';
+      if(installedDiv) installedDiv.style.display='none';
+      if(missingDiv) missingDiv.style.display='flex';
+    }else if(s.alive){
       ind.className='indicator alive';
-      st.textContent='ONLINE';
+      st.textContent=t('online');
       st.style.color='#0f0';
-      rt.textContent=s.response_time?s.response_time+'s':'checking...';
+      rt.textContent=s.response_time?s.response_time+'s':t('checking');
+      if(installedDiv) installedDiv.style.display='flex';
+      if(missingDiv) missingDiv.style.display='none';
     }else{
       ind.className='indicator dead';
-      st.textContent='OFFLINE';
+      st.textContent=t('offline');
       st.style.color='#f00';
       rt.textContent='--';
+      if(installedDiv) installedDiv.style.display='flex';
+      if(missingDiv) missingDiv.style.display='none';
     }
     
-    if(s.cookie_expiry_days !== null && s.cookie_expiry_days !== undefined){
+    if(s.installed && s.cookie_expiry_days !== null && s.cookie_expiry_days !== undefined){
       const d = s.cookie_expiry_days;
       let color = '#0f0';
       if(d < 7) color = '#fa0';
       if(d < 3) color = '#f00';
-      ck.textContent = d + ' days';
+      ck.textContent = d + ' ' + t('days');
       ck.style.color = color;
-    } else {
-      ck.textContent = 'unknown';
+    } else if(s.installed) {
+      ck.textContent = t('unknown');
       ck.style.color = '#060';
     }
+
+    // Proxy toggle
+    const toggle = document.getElementById(name+'ProxyToggle');
+    const urlInput = document.getElementById(name+'ProxyUrl');
+    if(toggle && urlInput){
+      const isOn = s.proxy && s.proxy !== null;
+      toggle.textContent = isOn ? '[ON]' : '[OFF]';
+      toggle.style.color = isOn ? '#0f0' : '#500';
+      toggle.title = isOn ? s.proxy : t('proxy_off');
+      urlInput.value = isOn ? s.proxy : '';
+      toggle.onclick = () => {
+        if(isOn){
+          // Turn off
+          saveProxyConfig(name, null);
+        } else {
+          // Turn on — use current URL input or default
+          const url = urlInput.value.trim() || 'http://127.0.0.1:12334';
+          saveProxyConfig(name, url);
+        }
+      };
+    }
+
+    // Upstream status — fetch from /api/upstream (polled)
+    const upEl = document.getElementById(name+'Upstream');
+    if(upEl){
+      if(!upEl._fetching){
+        upEl._fetching = true;
+        fetchUpstream();
+      }
+    }
+  }
+
+  // Fetch upstream data separately
+  async function fetchUpstream(){
+    const upData = await api('GET', '/api/upstream');
+    if(upData && !upData.error){
+      for(const n of ['gemini','claude']){
+        const el = document.getElementById(n+'Upstream');
+        if(!el) continue;
+        const u = upData[n];
+        if(u){
+          const d = u.direct ? 'Direct' : (u.proxy ? 'Via VPN' : 'Blocked');
+          const color = u.direct ? '#0f0' : (u.proxy ? '#fa0' : '#f00');
+          const icon = u.direct ? '✔' : (u.proxy ? '🔒' : '✖');
+          el.textContent = icon+' '+d;
+          el.style.color = color;
+        } else {
+          el.textContent = '--';
+          el.style.color = '#060';
+        }
+      }
+    }
+    // Re-fetch every 30s
+    setTimeout(fetchUpstream, 30000);
   }
   
   const vpn = document.getElementById('vpnStatus');
   if(data.vpn){
     const a = data.vpn.alive;
-    vpn.innerHTML = '<span class="indicator '+(a?'alive':'dead')+'" style="width:6px;height:6px"></span> VPN '+(a?'ONLINE':'OFFLINE');
+    vpn.innerHTML = '<span class="indicator '+(a?'alive':'dead')+'" style="width:6px;height:6px"></span> VPN '+(a?t('vpn_online'):t('vpn_offline'));
   }
   
   document.getElementById('timeDisplay').textContent = new Date().toLocaleTimeString();
@@ -700,9 +1257,9 @@ async function fetchLogs(){
     if(!box) continue;
     const data = await api('GET', `/api/logs/${name}`);
     if(data.log === null){
-      box.textContent = '[no log file]';
+      box.textContent = t('no_log');
     } else {
-      box.textContent = data.log || '[empty]';
+      box.textContent = data.log || t('empty');
     }
     box.scrollTop = box.scrollHeight;
   }
@@ -710,39 +1267,39 @@ async function fetchLogs(){
 
 // ── Actions ──
 async function doAction(name, action){
-  const labels = {
-    restart: 'RESTART',
-    cookies: 'REFRESH COOKIES'
-  };
-  askConfirm(
-    `${name.toUpperCase()} > ${labels[action]||action}\nThis will temporarily interrupt the proxy.`,
-    async ()=>{
-      const btn = event&&event.target||document.querySelector(`.card.${name} button`);
-      if(btn) btn.disabled=true;
-      const result = await api('POST', `/api/action/${name}/${action}`);
-      if(btn) btn.disabled=false;
-      if(result.success){
-        showToast(`${name} ${action}: OK — ${result.message||''}`, false);
-      }else{
-        showToast(`${name} ${action}: FAIL — ${result.message||result.error||''}`, true);
-      }
-      setTimeout(fetchStatus, 2000);
+  const popup = action==='restart' || action==='cookies';
+  if(popup){
+    const actionLabel = action === 'restart' ? t('btn_restart') : t('btn_export');
+    askConfirm(`${name.toUpperCase()} — ${actionLabel}?\n${t('prompt_restart')}`, doActionCb);
+  }else{
+    doActionCb();
+  }
+  async function doActionCb(){
+    const btn = event&&event.target||document.querySelector(`.card.${name} button`);
+    if(btn) btn.disabled=true;
+    const result = await api('POST', `/api/action/${name}/${action}`);
+    if(btn) btn.disabled=false;
+    if(result.success){
+      showToast(`${name} ${action}: OK — ${result.message||''}`, false);
+      setTimeout(fetchStatus, 3000);
+    }else{
+      showToast(`${name} ${action}: ${t('fail')} — ${result.message||result.error||''}`, true);
     }
-  );
+  }
 }
 
 // ── Test ──
 async function doTest(name){
   const div = document.getElementById(name+'Test');
-  div.textContent = '> sending request...';
+  div.textContent = '> '+t('sending');
   div.className = 'test-result';
   const result = await api('GET', `/api/test/${name}`);
   if(result.success){
     div.className = 'test-result success';
-    div.textContent = `> OK (${result.time}s): "${result.response}"`;
+    div.textContent = `> ${t('ok')} (${result.time}s): "${result.response}"`;
   }else{
     div.className = 'test-result fail';
-    div.textContent = `> FAIL (${result.time}s): ${result.response||'no response'}`;
+    div.textContent = `> ${t('fail')} (${result.time}s): ${result.response||t('no_response')}`;
   }
 }
 
@@ -762,7 +1319,7 @@ async function savePastedCookies(){
   const textarea = document.getElementById('pasteTextarea');
   const raw = textarea.value;
   if(!raw || raw.length < 20){
-    showToast('Paste is too short — copy the full export from cookies.txt', true);
+    showToast(t('toast_paste_short'), true);
     return;
   }
   textarea.disabled = true;
@@ -770,19 +1327,40 @@ async function savePastedCookies(){
     const r = await fetch(`/api/cookies/paste/${pasteTarget}`, {method:'POST', body:raw});
     const result = await r.json();
     if(result.success){
-      showToast(`${pasteTarget} cookies saved (${result.message})`, false);
+      showToast(`${pasteTarget} ${t('toast_saved')} (${result.message})`, false);
       closePasteOverlay();
       setTimeout(fetchStatus, 1000);
     }else{
-      showToast(`Error: ${result.message}`, true);
+      showToast(t('toast_error')+': ${result.message}', true);
     }
   }catch(e){
-    showToast(`Network error: ${e.message}`, true);
+    showToast(t('toast_network')+': ${e.message}', true);
   }
   textarea.disabled = false;
 }
 
-// ── Auto Polling ──
+// ── Proxy Config ──
+async function saveProxyConfig(name, proxyVal){
+  const result = await api('POST', `/api/config/${name}`, {proxy: proxyVal});
+  if(result.success){
+    showToast(`${name} proxy: ${t('proxy_saved')} (${proxyVal||'OFF'})`, false);
+    setTimeout(fetchStatus, 2000);
+  }else{
+    showToast(`${name} proxy: ${t('fail')} — ${result.message||''}`, true);
+  }
+}
+
+function saveProxy(name){
+  const url = document.getElementById(name+'ProxyUrl').value.trim();
+  if(!url){
+    showToast(t('proxy_no_url'), true);
+    return;
+  }
+  saveProxyConfig(name, url);
+}
+
+// ── Init ──
+applyLang();
 fetchStatus();
 fetchLogs();
 setInterval(fetchStatus, 10000);
@@ -793,15 +1371,33 @@ setInterval(fetchLogs, 5000);
 
 # ── Main ──────────────────────────────────────────────────────────────────
 
+class ThreadedPanelServer(ThreadingMixIn, http.server.HTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
 def serve_forever(host="0.0.0.0", port=8083):
-    server = http.server.HTTPServer((host, port), PanelHandler)
-    log(f"listening on http://{host}:{port}")
-    log(f"open http://127.0.0.1:{port} in your browser")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        log("shutting down")
-        server.shutdown()
+    server = None
+    while True:
+        try:
+            if server:
+                try:
+                    server.server_close()
+                except:
+                    pass
+            server = ThreadedPanelServer((host, port), PanelHandler)
+            log(f"listening on http://{host}:{port}")
+            log(f"open http://127.0.0.1:{port} in your browser")
+            server.serve_forever()
+        except KeyboardInterrupt:
+            log("shutting down")
+            try:
+                server.shutdown()
+            except:
+                pass
+            return
+        except Exception as e:
+            log(f"server crashed ({e}), restarting in 2 seconds...")
+            time.sleep(2)
 
 
 if __name__ == "__main__":
