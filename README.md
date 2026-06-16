@@ -8,7 +8,7 @@ Converts standard `/v1/chat/completions` requests to Claude.ai internal API. Wor
 
 - OpenAI-compatible `/v1/chat/completions`
 - Streaming (SSE) and non-streaming
-- Model: `claude-sonnet-4` (matches claude.ai free tier)
+- Model: `claude-3-5-sonnet`, `claude-3-5-haiku`, etc. (matches Claude.ai models)
 - Automatic TLS retry with exponential backoff
 - Rate-limit handling (429, daily reset)
 - CORS enabled
@@ -80,19 +80,7 @@ curl -s -X POST http://localhost:8082/v1/chat/completions \
 
 ## Cross-platform compatibility
 
-Currently **Linux-only** (tested on Debian/Ubuntu). The proxy script should work on macOS with minimal changes, but the **Control Panel** (`panel.py`) depends on Linux-specific tools:
-
-| Feature | Linux | macOS | Windows |
-|---------|-------|-------|---------|
-| Proxy core | ✅ | ⚠️ may work | ❌ `curl_cffi` needs OpenSSL |
-| Control Panel | ✅ | ❌ `fuser`, `xdg-open`, `ss` | ❌ |
-
-### Porting plan
-
-1. **Proxy core** (`claude_web2api.py`): replace `curl_cffi` with `httpx` (Windows-compatible)
-2. **Panel** (`panel.py`): replace `fuser` → `psutil` / `netstat`, `ss` → `socket` probe, `xdg-open` → `webbrowser.open`
-
-Contributions welcome!
+Fully compatible with **Linux, macOS, and Windows**. The proxy core and control features have been ported to work across platforms using standard library modules and cross-platform compatible libraries.
 
 ## FAQ
 

@@ -1,0 +1,21 @@
+ 69210[claude-proxy] config loaded: port=8082
+[claude-proxy] loaded 19 cookies from /home/skitchen/claude-web2api/cookie_claude.txt
+[claude-proxy] organization_id: 4a79d0ba-5c29-4d16-8aad-21e5001a0a8b
+[claude-proxy] listening on http://0.0.0.0:8082
+[claude-proxy] chat request: model=claude-3-5-sonnet-20241022, stream=False, messages=1
+[claude-proxy] "POST /v1/chat/completions HTTP/1.1" 200 -
+[claude-proxy] chat request: model=claude-3-5-sonnet-20241022, stream=True, messages=3
+[claude-proxy] chat request: model=claude-3-5-sonnet-20241022, stream=True, messages=5
+[claude-proxy] chat request: model=claude-3-5-sonnet-20241022, stream=True, messages=7
+[claude-proxy] chat request: model=claude-3-5-sonnet-20241022, stream=True, messages=9
+[claude-proxy] chat request: model=claude-3-5-sonnet-20241022, stream=True, messages=11
+[claude-proxy] chat request: model=claude-3-5-sonnet-20241022, stream=True, messages=13
+[claude-proxy] chat request: model=claude-3-5-sonnet-20241022, stream=True, messages=15
+[claude-proxy] chat request: model=claude-3-5-sonnet-20241022, stream=True, messages=17
+[claude-proxy] chat request: model=claude-3-5-sonnet-20241022, stream=True, messages=19
+[claude-proxy] chat request: model=claude-3-5-sonnet-20241022, stream=True, messages=21
+[claude-proxy] chat request: model=claude-3-5-sonnet-20241022, stream=True, messages=23
+[claude-proxy] chat request: model=claude-3-5-sonnet-20241022, stream=True, messages=25
+[claude-proxy] chat request: model=claude-3-5-sonnet-20241022, stream=True, messages=27
+[claude-proxy] chat request: model=claude-3-5-sonnet-20241022, stream=True, messages=29
+[claude-proxy] chat request: model=claude-3-5-sonnet-20241022, stream=True, messages=31

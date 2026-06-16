@@ -47,7 +47,7 @@ def _session():
     s = Session(impersonate="chrome110")
     s.headers.update({
         "User-Agent": CONFIG.get("user_agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"),
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
         "Accept-Language": "en-US,en;q=0.5",
         "DNT": "1",
     })
@@ -60,7 +60,15 @@ def claude_req(method, path, **kwargs):
     headers = kwargs.pop("headers", {})
     headers.setdefault("Cookie", COOKIE_STRING)
     s = _session()
-    return s.request(method, f"{CLAUDE_BASE}{path}", headers=headers, **kwargs)
+    # Improved Debug: log the request details
+    if method == "POST":
+        log(f"DEBUG: {method} {CLAUDE_BASE}{path} JSON={json.dumps(kwargs.get('json'))}")
+    else:
+        log(f"DEBUG: {method} {CLAUDE_BASE}{path}")
+    resp = s.request(method, f"{CLAUDE_BASE}{path}", headers=headers, **kwargs)
+    # Debug: log the response status and truncated content
+    log(f"DEBUG: Response {resp.status_code} {resp.text[:200]}")
+    return resp
 
 def claude_req_retry(method, path, retries=5, backoff=1, **kwargs):
     last_err = None
@@ -149,15 +157,11 @@ def format_prompt(messages):
     return "\n\n".join(parts)
 
 def get_timezone():
-    import subprocess
     try:
-        r = subprocess.run(["timedatectl", "show", "--property=Timezone", "--value"],
-                           capture_output=True, text=True, timeout=5)
-        if r.returncode == 0:
-            return r.stdout.strip()
+        from datetime import datetime
+        return datetime.now().astimezone().tzname()
     except:
-        pass
-    return "Europe/Moscow"
+        return "Europe/Moscow"
 
 def iter_sse_lines(resp):
     """Buffered SSE line iterator for curl_cffi streaming responses"""
@@ -226,6 +230,7 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
         if path == "/v1/models":
             models = [
                 {"id": "claude-3-5-sonnet-20241022", "object": "model", "created": 1728000000, "owned_by": "anthropic"},
+                {"id": "claude-3-5-haiku-20241022", "object": "model", "created": 1730000000, "owned_by": "anthropic"},
                 {"id": "claude-3-opus-20240229", "object": "model", "created": 1709164800, "owned_by": "anthropic"},
                 {"id": "claude-3-sonnet-20240229", "object": "model", "created": 1709164800, "owned_by": "anthropic"},
                 {"id": "claude-3-haiku-20240307", "object": "model", "created": 1709769600, "owned_by": "anthropic"},
@@ -383,6 +388,8 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
                         "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]
                     }
                     self._send_sse(json.dumps(chunk, ensure_ascii=False))
+            else:
+                log(f"debug: unknown event type {data.get('type')}: {data}")
 
         if not sent_content:
             log("stream ended with no content")
