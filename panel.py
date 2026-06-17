@@ -258,7 +258,7 @@ def run_health_test(name):
     port = GEMINI_PORT if name == "gemini" else CLAUDE_PORT
     url = f"http://127.0.0.1:{port}/v1/chat/completions"
     payload = {
-        "model": "gemini-3.5-flash" if name == "gemini" else "claude-sonnet-4",
+        "model": "gemini-3.5-flash" if name == "gemini" else "claude-haiku-4-5-20251001",
         "messages": [{"role": "user", "content": "say hi in 3 words or less"}],
         "max_tokens": 10,
     }

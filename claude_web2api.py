@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Claude.ai -> OpenAI-compatible proxy (port 8082)"""
 
-import json, os, sys, time, uuid
+import json, os, sys, time, uuid, re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse
@@ -130,6 +130,13 @@ def delete_chat(org_id, chat_id):
 
 def format_prompt(messages):
     parts = []
+    # Check if tools are available
+    has_tools = False
+    for msg in messages:
+        tc = msg.get("tool_calls")
+        if tc:
+            has_tools = True
+            break
     for msg in messages:
         role = msg.get("role", "user")
         content = msg.get("content") or ""
@@ -176,13 +183,30 @@ def iter_sse_lines(resp):
     if buf.strip():
         yield buf.strip()
 
-class ClaudeProxyHandler(BaseHTTPRequestHandler):
+def parse_tool_calls(text):
+    """Detect tool invocation patterns in Claude's text response.
+    Returns list of (name, args_json_str) or empty list."""
+    results = []
+    # Pattern 1: <invoke tool="NAME">\nARGS_JSON\n</invoke>
+    for m in re.finditer(r'<invoke\s+tool="([^"]+)"\s*>\s*\n?(\{.*?\})\s*\n?</invoke>', text, re.DOTALL):
+        results.append((m.group(1), m.group(2)))
+    if results:
+        return results
+    # Pattern 2: <atml:invoke name="NAME">...<atml:parameter name="P">V</atml:parameter>...</atml:invoke>
+    for m in re.finditer(r'<atml:invoke\s+name="([^"]+)"\s*>', text):
+        name = m.group(1)
+        rest = text[m.end():]
+        end_m = re.search(r'</atml:invoke>', rest)
+        if not end_m:
+            continue
+        body = rest[:end_m.start()]
+        params = {}
+        for pm in re.finditer(r'<atml:parameter\s+name="([^"]+)"\s*>([^<]*)</atml:parameter>', body):
+            params[pm.group(1)] = pm.group(2)
+        results.append((name, json.dumps(params)))
+    return results
 
-    def _sendall(self, data: bytes):
-        try:
-            self.request.sendall(data)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+class ClaudeProxyHandler(BaseHTTPRequestHandler):
 
     def _json_response(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode()
@@ -192,20 +216,22 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
-        self._sendall(body)
+        self.wfile.write(body)
 
     def _sse_headers(self):
-        self._sendall(
-            b"HTTP/1.1 200 OK\r\n"
-            b"Content-Type: text/event-stream; charset=utf-8\r\n"
-            b"Cache-Control: no-cache\r\n"
-            b"Access-Control-Allow-Origin: *\r\n"
-            b"Connection: close\r\n"
-            b"\r\n"
-        )
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Connection", "close")
+        self.end_headers()
 
     def _send_sse(self, data: str):
-        self._sendall(f"data: {data}\n\n".encode())
+        try:
+            self.wfile.write(f"data: {data}\n\n".encode())
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _sse_error(self, msg: str):
         """Send error message inside an already-open SSE stream, then stop."""
@@ -235,6 +261,7 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
                 {"id": "claude-3-sonnet-20240229", "object": "model", "created": 1709164800, "owned_by": "anthropic"},
                 {"id": "claude-3-haiku-20240307", "object": "model", "created": 1709769600, "owned_by": "anthropic"},
                 {"id": "claude-2.1", "object": "model", "created": 1701302400, "owned_by": "anthropic"},
+                {"id": "claude-haiku-4-5-20251001", "object": "model", "created": 1747000000, "owned_by": "anthropic"},
             ]
             self._json_response(200, {"object": "list", "data": models})
         elif path == "/health" or path == "/":
@@ -351,7 +378,8 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
     def _stream_response(self, upstream, model):
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
-        sent_content = False
+        buf = ""
+        tool_call = None
 
         for line in iter_sse_lines(upstream):
             if not line or not line.startswith("data: "):
@@ -364,13 +392,7 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
             if data.get("type") == "completion":
                 text = data.get("completion", "")
                 if text:
-                    sent_content = True
-                    chunk = {
-                        "id": completion_id, "object": "chat.completion.chunk",
-                        "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]
-                    }
-                    self._send_sse(json.dumps(chunk, ensure_ascii=False))
+                    buf += text
             elif data.get("type") == "error":
                 log(f"upstream SSE error: {data}")
                 self._sse_error(data.get("message", str(data)))
@@ -381,18 +403,68 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
             elif data.get("type") == "content_block_delta":
                 text = data.get("delta", {}).get("text", "")
                 if text:
-                    sent_content = True
-                    chunk = {
-                        "id": completion_id, "object": "chat.completion.chunk",
-                        "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]
-                    }
-                    self._send_sse(json.dumps(chunk, ensure_ascii=False))
+                    buf += text
             else:
                 log(f"debug: unknown event type {data.get('type')}: {data}")
 
-        if not sent_content:
-            log("stream ended with no content")
+        # Check for tool invocations in Claude's response
+        if buf:
+            tool_calls = parse_tool_calls(buf)
+            if tool_calls:
+                for idx, (name, args_str) in enumerate(tool_calls):
+                    tc_id = f"call_{uuid.uuid4().hex[:16]}"
+                    # Name chunk
+                    chunk = {
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": idx, "id": tc_id,
+                                    "type": "function",
+                                    "function": {"name": name, "arguments": ""}
+                                }]
+                            },
+                            "finish_reason": None
+                        }]
+                    }
+                    self._send_sse(json.dumps(chunk, ensure_ascii=False))
+                    # Arguments chunk
+                    chunk2 = {
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": idx,
+                                    "function": {"arguments": args_str}
+                                }]
+                            },
+                            "finish_reason": None
+                        }]
+                    }
+                    self._send_sse(json.dumps(chunk2, ensure_ascii=False))
+                # Final chunk
+                final = {
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+                }
+                self._send_sse(json.dumps(final, ensure_ascii=False))
+                self._send_sse("[DONE]")
+                self.close_connection = True
+                return
+
+        # No tool call — send as content
+        if buf:
+            chunk = {
+                "id": completion_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {"content": buf}, "finish_reason": None}]
+            }
+            self._send_sse(json.dumps(chunk, ensure_ascii=False))
 
         final = {
             "id": completion_id, "object": "chat.completion.chunk",
@@ -423,6 +495,30 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
                 return
 
         content = "".join(content_parts).strip()
+
+        # Check for tool invocations
+        tool_calls = parse_tool_calls(content)
+        if tool_calls:
+            tcs = []
+            for name, args_str in tool_calls:
+                tcs.append({
+                    "id": f"call_{uuid.uuid4().hex[:16]}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": args_str}
+                })
+            resp = {
+                "id": completion_id, "object": "chat.completion",
+                "created": created, "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": None, "tool_calls": tcs},
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            }
+            self._json_response(200, resp)
+            return
+
         resp = {
             "id": completion_id, "object": "chat.completion",
             "created": created, "model": model,
