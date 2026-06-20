@@ -1,8 +1,12 @@
-# Claude Web2API
+# Claude Web2API — OpenAI-Compatible Proxy for Claude.ai
+
+> **[Keywords]**: Claude.ai API proxy · OpenAI-compatible · LLM proxy server · ChatGPT alternative · Claude web API wrapper · cookie-based auth · self-hosted Claude API · SSE streaming · Python proxy · Cloudflare bypass · tool calling support
 
 OpenAI-compatible proxy for [Claude.ai](https://claude.ai) Web API.
 
 Converts standard `/v1/chat/completions` requests to Claude.ai internal API. Works via cookie-based auth — no API key needed.
+
+**Use cases**: local development, testing, automation, integrating Claude.ai into OpenAI-compatible tools
 
 ## Features
 
@@ -19,6 +23,12 @@ Converts standard `/v1/chat/completions` requests to Claude.ai internal API. Wor
 - `pip install -r requirements.txt` (uses `curl_cffi` with Chrome impersonation)
 - **Firefox** with [cookies.txt](https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/) extension
 - **VPN/proxy** — Claude.ai blocks non-residential IPs (Cloudflare)
+
+## Keywords / SEO
+
+`claude-api`, `openai-api`, `proxy-server`, `llm`, `sse-streaming`, `python-proxy`, `claude-web-api`, `cookie-auth`, `cloudflare-bypass`, `function-calling`, `tool-use`, `openai-compatible`
+
+---
 
 ## Setup (step by step)
 
@@ -105,6 +115,10 @@ claude-web2api/
 ├── README.md
 └── LICENSE
 ```
+
+## Architecture
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for full system diagrams, flow charts, and component breakdown.
 
 ## License
 
