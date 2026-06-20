@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Claude.ai -> OpenAI-compatible proxy (port 8082)"""
 
-import json, os, sys, time, uuid
+import json, os, sys, time, uuid, re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse
@@ -12,6 +12,7 @@ CONFIG = {}
 COOKIE_STRING = ""
 ORGANIZATION_ID = None
 CLAUDE_BASE = "https://claude.ai"
+RATE_LIMIT_FILE = "/tmp/claude_rate_limit.json"
 
 def log(msg):
     print(f"[claude-proxy] {msg}", file=sys.stderr, flush=True)
@@ -60,15 +61,56 @@ def claude_req(method, path, **kwargs):
     headers = kwargs.pop("headers", {})
     headers.setdefault("Cookie", COOKIE_STRING)
     s = _session()
-    # Improved Debug: log the request details
     if method == "POST":
         log(f"DEBUG: {method} {CLAUDE_BASE}{path} JSON={json.dumps(kwargs.get('json'))}")
     else:
         log(f"DEBUG: {method} {CLAUDE_BASE}{path}")
     resp = s.request(method, f"{CLAUDE_BASE}{path}", headers=headers, **kwargs)
-    # Debug: log the response status and truncated content
-    log(f"DEBUG: Response {resp.status_code} {resp.text[:200]}")
+    if kwargs.get("stream"):
+        log(f"DEBUG: Response {resp.status_code} (streaming)")
+    else:
+        log(f"DEBUG: Response {resp.status_code} {resp.text[:200]}")
     return resp
+
+def _save_429_info(resp):
+    """Save 429 rate limit info to file for the panel to read."""
+    info = {"time": time.time(), "retry_after": None}
+    # Try Retry-After header
+    ra = resp.headers.get("retry-after") or resp.headers.get("Retry-After")
+    if ra:
+        try:
+            info["retry_after"] = int(ra)
+        except:
+            try:
+                info["retry_after"] = int(time.mktime(time.strptime(ra, "%a, %d %b %Y %H:%M:%S %Z")) - time.time())
+            except:
+                pass
+    # Try body — read raw content (stream=True so .text may be empty)
+    if not info["retry_after"]:
+        try:
+            body_bytes = b"".join(resp.iter_content()) if hasattr(resp, 'iter_content') else (resp.content or b"")
+            body_text = body_bytes.decode(errors='replace')
+            body = json.loads(body_text)
+            # Claude nests rate limit info in error.message JSON
+            err = body.get("error", {})
+            inner = err.get("message", "")
+            if isinstance(inner, str) and inner.startswith("{"):
+                inner_data = json.loads(inner)
+                resets_at = inner_data.get("resetsAt")
+                if resets_at:
+                    info["retry_after"] = max(1, int(resets_at - time.time()))
+            if not info["retry_after"]:
+                info["retry_after"] = body.get("retry_after_seconds") or body.get("retry_after") or None
+        except Exception as e:
+            log(f"429 body parse error: {e}")
+    if info["retry_after"]:
+        info["reset_at"] = time.time() + info["retry_after"]
+    try:
+        with open(RATE_LIMIT_FILE, "w") as f:
+            json.dump(info, f)
+    except:
+        pass
+    return info
 
 def claude_req_retry(method, path, retries=5, backoff=1, **kwargs):
     last_err = None
@@ -76,7 +118,8 @@ def claude_req_retry(method, path, retries=5, backoff=1, **kwargs):
         try:
             resp = claude_req(method, path, **kwargs)
             if resp.status_code == 429 and attempt < retries:
-                delay = backoff * (2 ** attempt) + 1
+                rl = _save_429_info(resp)
+                delay = rl.get("retry_after") or (backoff * (2 ** attempt) + 1)
                 log(f"claude_req retry {attempt+1}/{retries} (429, wait {delay}s)")
                 time.sleep(delay)
                 continue
@@ -128,31 +171,89 @@ def delete_chat(org_id, chat_id):
     except:
         pass
 
-def format_prompt(messages):
+def format_tools(tools):
+    """Convert OpenAI tools to Claude's native XML tool format."""
+    if not tools:
+        return ""
+    lines = []
+    for t in tools:
+        if t.get("type") != "function":
+            continue
+        fn = t.get("function", {})
+        name = fn.get("name", "unknown")
+        desc = fn.get("description", "")
+        lines.append(f"  Tool: {name}")
+        if desc:
+            lines.append(f"    Description: {desc}")
+        params = fn.get("parameters", {})
+        if params.get("properties"):
+            lines.append("    Parameters:")
+            for pname, pinfo in params["properties"].items():
+                req = "required" if pname in params.get("required", []) else "optional"
+                ptype = pinfo.get("type", "string")
+                pdesc = pinfo.get("description", "")
+                lines.append(f"      {pname} ({ptype}, {req}): {pdesc}")
+    return "\n".join(lines)
+
+def _native_tool_fmt(name, args_dict):
+    """Convert tool name + args dict to Claude's native XML format."""
+    parts = [f"<invoke name=\"{name}\">"]
+    for k, v in args_dict.items():
+        parts.append(f"<parameter name=\"{k}\">{v}</parameter>")
+    parts.append("</invoke>")
+    return "\n".join(parts)
+
+def _detect_lang(messages):
+    """Check if any user message contains Cyrillic → force Russian."""
+    for m in messages:
+        if m.get("role") in ("user", "system"):
+            txt = m.get("content", "") or ""
+            if any("\u0400" <= c <= "\u04FF" or "\u0500" <= c <= "\u052F" for c in txt):
+                return "ru"
+    return "en"
+
+def format_prompt(messages, tools=None):
+    tool_block = format_tools(tools) if tools else ""
+    lang = _detect_lang(messages)
+    lang_hint = "\n\nIMPORTANT: Always respond in Russian.\n" if lang == "ru" else ""
     parts = []
+    added_tools = False
     for msg in messages:
         role = msg.get("role", "user")
         content = msg.get("content") or ""
         if role == "system":
-            parts.append(f"System: {content}")
+            text = f"System: {content}{lang_hint}"
+            if tool_block and not added_tools:
+                text += f"\n\nYou have access to the following tools. Use them by enclosing your tool calls in <function_calls> and </function_calls> XML tags:\n{tool_block}"
+                added_tools = True
+            parts.append(text)
         elif role == "user":
             parts.append(f"Human: {content}")
         elif role == "assistant":
             tc = msg.get("tool_calls")
-            if tc and not content:
-                tool_blocks = []
+            if tc:
+                calls = []
                 for t in tc:
                     name = t.get("function", {}).get("name", "unknown")
-                    args = t.get("function", {}).get("arguments", "{}")
-                    tool_blocks.append(f"<invoke tool=\"{name}\">\n{args}\n</invoke>")
-                parts.append("Assistant:\n" + "\n".join(tool_blocks))
+                    try:
+                        args = json.loads(t.get("function", {}).get("arguments", "{}"))
+                    except:
+                        args = {}
+                    calls.append(_native_tool_fmt(name, args))
+                text = f"Assistant: {content}\n<function_calls>\n" if content else "Assistant:\n<function_calls>\n"
+                text += "\n".join(calls) + "\n</function_calls>"
+                parts.append(text)
             else:
                 parts.append(f"Assistant: {content}")
         elif role == "tool":
             name = msg.get("name", "")
             tid = msg.get("tool_call_id", "")
             label = f" (tool: {name})" if name else f" (id: {tid})" if tid else ""
-            parts.append(f"Human: [Tool result{label}]\n{content}")
+            # Claude expects tool results as a function return in the conversation
+            result_content = content[:500]  # truncate to avoid huge prompts
+            parts.append(f"Human: [Tool result{label}]\n{result_content}")
+    if tool_block and not added_tools:
+        parts.insert(0, f"System:{lang_hint} You have access to the following tools. Use them by enclosing your tool calls in <function_calls> and </function_calls> XML tags:\n{tool_block}")
     parts.append("Assistant:")
     return "\n\n".join(parts)
 
@@ -238,8 +339,19 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
             ]
             self._json_response(200, {"object": "list", "data": models})
         elif path == "/health" or path == "/":
+            rl = {}
+            if os.path.exists(RATE_LIMIT_FILE):
+                try:
+                    with open(RATE_LIMIT_FILE) as f:
+                        rl = json.load(f)
+                    # Clear stale (>30 min) entries
+                    if rl.get("time", 0) < time.time() - 1800:
+                        rl = {}
+                except:
+                    pass
             self._json_response(200, {"status": "ok", "org_id": ORGANIZATION_ID,
-                                      "cookies": bool(COOKIE_STRING)})
+                                      "cookies": bool(COOKIE_STRING),
+                                      "rate_limit": rl})
         else:
             self._json_response(404, {"error": "not found"})
 
@@ -285,9 +397,10 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
             self._json_response(400, {"error": "no messages"})
             return
 
+        tools = req.get("tools") or req.get("functions")
         model = req.get("model") or CONFIG.get("model") or "claude"
-        prompt = format_prompt(messages)
-        log(f"chat request: model={model}, stream={stream}, messages={len(messages)}")
+        prompt = format_prompt(messages, tools)
+        log(f"chat request: model={model}, stream={stream}, messages={len(messages)}, tools={len(tools) if tools else 0}")
 
         chat_id = create_chat(ORGANIZATION_ID)
         if not chat_id:
@@ -348,10 +461,57 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
             except:
                 pass
 
+    def _parse_tool_calls(self, text):
+        """Parse Claude's tool call XML from text into OpenAI tool_calls list."""
+        calls = []
+
+        # Claude's native format: extract invoke name + all parameters
+        # Works with truncated XML (missing closing tags)
+        invoke_re = re.compile(
+            r'<invoke name="([^"]+)">(.*?)(?:</invoke>|$)',
+            re.DOTALL
+        )
+        param_re = re.compile(
+            r'<parameter name="([^"]+)">(.*?)(?:</parameter>|$)',
+            re.DOTALL
+        )
+        for im in invoke_re.finditer(text):
+            name = im.group(1)
+            params_body = im.group(2)
+            args = {}
+            for pm in param_re.finditer(params_body):
+                val = pm.group(2).strip()
+                if val:
+                    args[pm.group(1)] = val
+            calls.append({
+                "id": f"call_{uuid.uuid4().hex[:12]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(args, ensure_ascii=False)
+                }
+            })
+
+        # Fallback to simple <invoke tool="name">JSON</invoke> format
+        if not calls:
+            simple = re.compile(r'<invoke tool="([^"]+)">\s*\n?(\{.*?\})\n?\s*</invoke>', re.DOTALL)
+            for m in simple.finditer(text):
+                calls.append({
+                    "id": f"call_{uuid.uuid4().hex[:12]}",
+                    "type": "function",
+                    "function": {
+                        "name": m.group(1),
+                        "arguments": m.group(2)
+                    }
+                })
+
+        return calls if calls else None
+
     def _stream_response(self, upstream, model):
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
-        sent_content = False
+        buffer = ""
+        tool_mode = False
 
         for line in iter_sse_lines(upstream):
             if not line or not line.startswith("data: "):
@@ -363,14 +523,8 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
 
             if data.get("type") == "completion":
                 text = data.get("completion", "")
-                if text:
-                    sent_content = True
-                    chunk = {
-                        "id": completion_id, "object": "chat.completion.chunk",
-                        "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]
-                    }
-                    self._send_sse(json.dumps(chunk, ensure_ascii=False))
+            elif data.get("type") == "content_block_delta":
+                text = data.get("delta", {}).get("text", "")
             elif data.get("type") == "error":
                 log(f"upstream SSE error: {data}")
                 self._sse_error(data.get("message", str(data)))
@@ -378,10 +532,19 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
                 return
             elif data.get("type") in ("message_stop", "stop"):
                 break
-            elif data.get("type") == "content_block_delta":
-                text = data.get("delta", {}).get("text", "")
-                if text:
-                    sent_content = True
+            else:
+                continue
+
+            if not text:
+                continue
+
+            if not tool_mode:
+                if "<invoke " in (buffer + text):
+                    tool_mode = True
+                    buffer += text
+                else:
+                    # Stream as content — no tool calls detected yet
+                    buffer += text
                     chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": model,
@@ -389,17 +552,44 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
                     }
                     self._send_sse(json.dumps(chunk, ensure_ascii=False))
             else:
-                log(f"debug: unknown event type {data.get('type')}: {data}")
+                buffer += text
 
-        if not sent_content:
+        sent_finish = False
+
+        if tool_mode:
+            tool_calls = self._parse_tool_calls(buffer)
+            if tool_calls:
+                chunk = {
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"tool_calls": tool_calls},
+                        "finish_reason": "tool_calls"
+                    }]
+                }
+                self._send_sse(json.dumps(chunk, ensure_ascii=False))
+                sent_finish = True
+                log(f"detected {len(tool_calls)} tool call(s) in response")
+            else:
+                # Tool mode but no valid tool calls — send buffer as content
+                for i in range(0, len(buffer), 200):
+                    self._send_sse(json.dumps({
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model,
+                        "choices": [{"index": 0, "delta": {"content": buffer[i:i+200]}, "finish_reason": None}]
+                    }, ensure_ascii=False))
+                sent_finish = False  # needs trailing stop
+        elif not buffer:
             log("stream ended with no content")
 
-        final = {
-            "id": completion_id, "object": "chat.completion.chunk",
-            "created": created, "model": model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-        }
-        self._send_sse(json.dumps(final, ensure_ascii=False))
+        if not sent_finish:
+            final = {
+                "id": completion_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            }
+            self._send_sse(json.dumps(final, ensure_ascii=False))
         self._send_sse("[DONE]")
         self.close_connection = True
 
@@ -417,20 +607,29 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
                 continue
             if data.get("type") == "completion":
                 content_parts.append(data.get("completion", ""))
+            elif data.get("type") == "content_block_delta":
+                text = data.get("delta", {}).get("text", "")
+                if text:
+                    content_parts.append(text)
             elif data.get("type") == "error":
                 log(f"upstream error: {data}")
                 self._json_response(502, {"error": data.get("message", str(data))})
                 return
 
         content = "".join(content_parts).strip()
+        tool_calls = self._parse_tool_calls(content)
+
+        if tool_calls:
+            msg = {"role": "assistant", "content": None, "tool_calls": tool_calls}
+            finish = "tool_calls"
+        else:
+            msg = {"role": "assistant", "content": content}
+            finish = "stop"
+
         resp = {
             "id": completion_id, "object": "chat.completion",
             "created": created, "model": model,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop"
-            }],
+            "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         }
         self._json_response(200, resp)
