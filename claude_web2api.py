@@ -203,11 +203,23 @@ def _native_tool_fmt(name, args_dict):
     parts.append("</invoke>")
     return "\n".join(parts)
 
+def _extract_text(content):
+    """Extract plain text message content (string or list of content blocks)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+        return " ".join(parts)
+    return str(content) if content else ""
+
 def _detect_lang(messages):
     """Check if any user message contains Cyrillic → force Russian."""
     for m in messages:
         if m.get("role") in ("user", "system"):
-            txt = m.get("content", "") or ""
+            txt = _extract_text(m.get("content")) or ""
             if any("\u0400" <= c <= "\u04FF" or "\u0500" <= c <= "\u052F" for c in txt):
                 return "ru"
     return "en"
@@ -220,7 +232,7 @@ def format_prompt(messages, tools=None):
     added_tools = False
     for msg in messages:
         role = msg.get("role", "user")
-        content = msg.get("content") or ""
+        content = _extract_text(msg.get("content")) or ""
         if role == "system":
             text = f"System: {content}{lang_hint}"
             if tool_block and not added_tools:
